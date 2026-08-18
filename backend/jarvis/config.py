@@ -112,11 +112,17 @@ class PermissionsConfig:
 
 @dataclass
 class DeviceConfig:
-    """Autonomous device learning — profile the host on startup and refresh periodically."""
+    """Autonomous device / peripheral learning — profile the host and attached hardware."""
 
     auto_learn: bool = field(default_factory=lambda: _env_bool("JARVIS_DEVICE_AUTO_LEARN", True))
     refresh_hours: float = field(
         default_factory=lambda: float(_env("JARVIS_DEVICE_REFRESH_HOURS", default="6"))
+    )
+    scan_peripherals: bool = field(
+        default_factory=lambda: _env_bool("JARVIS_SCAN_PERIPHERALS", True)
+    )
+    peripheral_refresh_minutes: float = field(
+        default_factory=lambda: float(_env("JARVIS_PERIPHERAL_REFRESH_MINUTES", default="15"))
     )
 
 
@@ -269,9 +275,11 @@ class ConfigStore:
             elif key == "device" and isinstance(value, dict):
                 for k, v in value.items():
                     if hasattr(cfg.device, k):
-                        if k == "auto_learn":
+                        if k in {"auto_learn", "scan_peripherals"}:
                             setattr(cfg.device, k, bool(v))
                         elif k == "refresh_hours":
+                            setattr(cfg.device, k, float(v))
+                        elif k == "peripheral_refresh_minutes":
                             setattr(cfg.device, k, float(v))
                         else:
                             setattr(cfg.device, k, v)

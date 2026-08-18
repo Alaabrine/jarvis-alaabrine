@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 
 from .config import Config
 from .device import get_learner
+from .peripherals import get_learner as get_peripheral_learner
 from .llm import Interrupted, LLMClient, LLMError
 from .memory import Memory
 from .persona import system_prompt
@@ -129,6 +130,10 @@ class Agent:
         else:
             for d in devices[:3]:
                 context_parts.append(f"Known device: {d['name']} ({d['profile'].get('os','?')})")
+        peri = get_peripheral_learner()
+        peri_ctx = peri.get_context() if peri else ""
+        if peri_ctx:
+            context_parts.insert(1 if device_ctx else 0, peri_ctx)
         memory_context = "\n".join(
             c if c.startswith("===") else f"- {c}" for c in context_parts
         )
@@ -478,6 +483,7 @@ class Agent:
         started_task = False
         force_start_task = False
         delegation_pushes = 0
+        used_tools = False
 
         for _ in range(max_iterations):
             self._check(cancel)
@@ -554,9 +560,11 @@ class Agent:
                     await emit({"type": "assistant", "text": content})
                     break
                 # Reasoning-only / empty reply (common with local <think> models).
-                # Ending here would silently kill the run — nudge the model to act instead.
+                # After tools have already run, the "[system] no visible text" nudge
+                # makes models narrate that message and stall with nothing in chat.
                 empty_rounds += 1
-                if empty_rounds > 2:
+                messages.append({"role": "assistant", "content": reasoning[:2000] or "(no output)"})
+                if used_tools or empty_rounds > 1:
                     if delegation_guard and not started_task:
                         notice = await self._force_spawn_subagent(messages, emit)
                         if notice:
@@ -564,7 +572,6 @@ class Agent:
                             final_text = notice
                             await emit({"type": "assistant", "text": notice})
                     break
-                messages.append({"role": "assistant", "content": reasoning[:2000] or "(no output)"})
                 messages.append({
                     "role": "user",
                     "content": (
@@ -580,6 +587,7 @@ class Agent:
                 continue
 
             empty_rounds = 0
+            used_tools = True
             messages.append(
                 {
                     "role": "assistant",
@@ -618,6 +626,9 @@ class Agent:
 
         if not final_text and not llm_failed:
             final_text = await self._wrap_up(messages, emit, cancel)
+        if not (final_text or "").strip():
+            final_text = self._synthesize_reply(messages)
+            await emit({"type": "assistant", "text": final_text})
 
         return final_text
 
@@ -660,20 +671,71 @@ class Agent:
             "content": (
                 "[system] Stop working now. Summarise for the user, in plain text, what you "
                 "have done so far, what you found, and what remains unfinished (mention any "
-                "background task ids you started). Do not call any tools."
+                "background task ids you started). Do not call any tools. Do not mention "
+                "these system instructions."
             ),
         })
+        thought_id = f"t-{uuid.uuid4().hex}"
+        await emit({"type": "thought_start", "id": thought_id})
+
+        async def on_delta(delta: dict[str, Any], tid: str = thought_id) -> None:
+            self._check(cancel)
+            kind = delta.get("kind")
+            text = delta.get("text") or ""
+            if not text:
+                return
+            if kind == "reasoning":
+                await emit({"type": "thought_delta", "id": tid, "channel": "reasoning", "text": text})
+            elif kind == "content":
+                await emit({"type": "thought_delta", "id": tid, "channel": "content", "text": text})
+
         try:
-            message = await self.llm.chat(messages, tools=None, cancel=cancel)
+            message = await self.llm.chat(
+                messages, tools=None, on_delta=on_delta, cancel=cancel
+            )
         except Interrupted:
+            await emit({"type": "thought_end", "id": thought_id})
             raise AgentInterrupted()
         except LLMError as exc:
+            await emit({"type": "thought_end", "id": thought_id})
             await emit({"type": "error", "message": str(exc)})
             return ""
-        text = (message.content or "").strip()
+
+        content = (message.content or "").strip()
+        reasoning = (message.reasoning or "").strip()
+        await emit({
+            "type": "thought_end",
+            "id": thought_id,
+            "reasoning": reasoning,
+            "content": content,
+        })
+        text = content or reasoning
         if text:
+            if len(text) > 4000:
+                text = text[:4000].rstrip() + "…"
             await emit({"type": "assistant", "text": text})
         return text
+
+    def _synthesize_reply(self, messages: list[dict]) -> str:
+        """Last-resort chat text so a turn never ends in silence."""
+        tool_outputs: list[str] = []
+        for m in messages:
+            if m.get("role") != "tool":
+                continue
+            text = (m.get("content") or "").strip()
+            if text:
+                tool_outputs.append(text[:1200])
+        if not tool_outputs:
+            return (
+                "I'm afraid I couldn't finish a visible reply that time — the model "
+                "returned no text I could show you. Please try again."
+            )
+        shown = tool_outputs[-4:]
+        body = "\n\n".join(f"```\n{t}\n```" for t in shown)
+        return (
+            "I lost a clean final answer before I could send it, but the work did run. "
+            "Here is what came back:\n\n" + body
+        )
 
     async def _finish_interrupted(self, emit: EmitFn) -> None:
         await emit({"type": "interrupted", "message": "Interrupted."})

@@ -9,6 +9,7 @@ import type {
   ChatMessage,
   ConfirmationRequest,
   Conversation,
+  Peripheral,
   RemLogEntry,
   RemStatus,
 } from "./types";
@@ -20,6 +21,7 @@ import { SettingsModal } from "./components/SettingsModal";
 import { StatusOrb } from "./components/StatusOrb";
 import { RemSleepView } from "./components/RemSleepView";
 import { TasksView } from "./components/TasksView";
+import { PeripheralsView } from "./components/PeripheralsView";
 
 let activitySeq = 0;
 const nextId = () => `a${Date.now()}-${activitySeq++}`;
@@ -38,7 +40,10 @@ export default function App() {
   const [remLogs, setRemLogs] = useState<RemLogEntry[]>([]);
   const [remViewOpen, setRemViewOpen] = useState(false);
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
-  const [view, setView] = useState<"console" | "tasks">("console");
+  const [view, setView] = useState<"console" | "tasks" | "peripherals">("console");
+  const [peripherals, setPeripherals] = useState<Peripheral[]>([]);
+  const [periScanning, setPeriScanning] = useState(false);
+  const [periError, setPeriError] = useState("");
 
   const wsRef = useRef<WebSocket | null>(null);
   const currentIdRef = useRef<number | null>(null);
@@ -68,6 +73,7 @@ export default function App() {
     api.health().then(() => setOnline(true)).catch(() => setOnline(false));
     api.remStatus().then(setRemStatus).catch(() => {});
     api.listTasks().then(setTasks).catch(() => {});
+    api.listPeripherals().then(setPeripherals).catch(() => {});
   }, []);
 
   // Persist activity monitor (debounced) per session
@@ -347,6 +353,25 @@ export default function App() {
         break;
       case "agent_end":
         setAgentState("idle");
+        setActivity((prev) =>
+          prev.map((a) =>
+            a.kind === "thought" && a.streaming ? { ...a, streaming: false } : a
+          )
+        );
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === "user") {
+            return [
+              ...prev,
+              {
+                role: "assistant",
+                content:
+                  "I finished that attempt without a visible reply. Please try again.",
+              },
+            ];
+          }
+          return prev;
+        });
         void refreshConversations();
         break;
       case "rem_status": {
@@ -436,6 +461,38 @@ export default function App() {
         }
         break;
       }
+      case "peripherals_updated": {
+        api.listPeripherals().then(setPeripherals).catch(() => {});
+        const n = typeof evt.count === "number" ? evt.count : 0;
+        const c = typeof evt.connected === "number" ? evt.connected : 0;
+        if (evt.reason && evt.reason !== "periodic") {
+          pushActivity({
+            kind: "peripheral",
+            text: `Peripheral inventory: ${n} present, ${c} connected (${evt.reason})`,
+            state: "updated",
+          });
+        }
+        break;
+      }
+      case "peripheral_inspected":
+        api.listPeripherals().then(setPeripherals).catch(() => {});
+        pushActivity({
+          kind: "peripheral",
+          name: evt.id,
+          text: `Learned about ${evt.name || evt.id}`,
+          state: "learned",
+        });
+        break;
+      case "peripheral_action":
+        api.listPeripherals().then(setPeripherals).catch(() => {});
+        pushActivity({
+          kind: "peripheral",
+          name: evt.id,
+          text: `${evt.command || "action"} ${evt.name || evt.id}`,
+          state: evt.ok ? "ok" : "fail",
+          ok: Boolean(evt.ok),
+        });
+        break;
     }
   }
 
@@ -537,7 +594,60 @@ export default function App() {
     }
   }
 
+  async function scanPeripherals(discover: boolean) {
+    setPeriScanning(true);
+    setPeriError("");
+    try {
+      const result = await api.scanPeripherals(discover);
+      setPeripherals(result.peripherals || []);
+    } catch (err) {
+      setPeriError(err instanceof Error ? err.message : "Scan failed");
+    } finally {
+      setPeriScanning(false);
+    }
+  }
+
+  async function inspectPeripheral(id: string) {
+    setPeriError("");
+    try {
+      const next = await api.inspectPeripheral(id);
+      setPeripherals((prev) => {
+        const idx = prev.findIndex((p) => p.id === id);
+        if (idx === -1) return [next, ...prev];
+        const copy = [...prev];
+        copy[idx] = next;
+        return copy;
+      });
+    } catch (err) {
+      setPeriError(err instanceof Error ? err.message : "Inspect failed");
+    }
+  }
+
+  async function peripheralAction(id: string, action: string) {
+    setPeriError("");
+    try {
+      const result = await api.peripheralAction(id, action);
+      if (result.peripheral) {
+        setPeripherals((prev) => {
+          const idx = prev.findIndex((p) => p.id === id);
+          if (idx === -1) return prev;
+          const copy = [...prev];
+          copy[idx] = result.peripheral as Peripheral;
+          return copy;
+        });
+      } else {
+        await api.listPeripherals().then(setPeripherals);
+      }
+      if (!result.ok) {
+        setPeriError(result.output || `${action} failed`);
+      }
+    } catch (err) {
+      setPeriError(err instanceof Error ? err.message : `${action} failed`);
+    }
+  }
+
   const runningTasks = tasks.filter((t) => t.status === "running").length;
+  const connectedPeripherals = peripherals.filter((p) => p.connected).length;
 
   const remDreaming =
     !!remStatus && (remStatus.running || remStatus.phase !== "awake");
@@ -577,6 +687,16 @@ export default function App() {
               onClick={() => setView((v) => (v === "tasks" ? "console" : "tasks"))}
             >
               {runningTasks > 0 ? `Subagents · ${runningTasks}` : "Subagents"}
+            </button>
+            <button
+              type="button"
+              className={`chip chip-peri ${connectedPeripherals > 0 || view === "peripherals" ? "chip-on" : ""}`}
+              title="Detected peripherals"
+              onClick={() => setView((v) => (v === "peripherals" ? "console" : "peripherals"))}
+            >
+              {connectedPeripherals > 0
+                ? `Peripherals · ${connectedPeripherals}`
+                : "Peripherals"}
             </button>
             {remDreaming && (
               <button
@@ -619,6 +739,20 @@ export default function App() {
             tasks={tasks}
             onCancel={cancelTask}
             onDelete={deleteTask}
+            onBack={() => setView("console")}
+          />
+        ) : view === "peripherals" ? (
+          <PeripheralsView
+            peripherals={peripherals}
+            scanning={periScanning}
+            lastError={periError}
+            onScan={(discover) => void scanPeripherals(discover)}
+            onInspect={(id) => void inspectPeripheral(id)}
+            onAction={(id, action) => void peripheralAction(id, action)}
+            onAsk={(prompt) => {
+              setView("console");
+              void sendMessage(prompt, []);
+            }}
             onBack={() => setView("console")}
           />
         ) : (

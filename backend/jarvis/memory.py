@@ -60,6 +60,18 @@ class Memory:
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS peripherals (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                address TEXT,
+                connected INTEGER NOT NULL DEFAULT 0,
+                available INTEGER NOT NULL DEFAULT 1,
+                profile TEXT NOT NULL,
+                facts TEXT NOT NULL DEFAULT '[]',
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
@@ -313,6 +325,105 @@ class Memory:
                 pass
             result.append(d)
         return result
+
+    # --- Peripherals ---------------------------------------------------
+    def upsert_peripheral(self, peripheral: dict[str, Any]) -> None:
+        now = time.time()
+        pid = str(peripheral.get("id") or "").strip()
+        if not pid:
+            return
+        payload = json.dumps(peripheral)
+        facts = json.dumps(peripheral.get("facts") or [])
+        first_seen = float(peripheral.get("first_seen") or now)
+        last_seen = float(peripheral.get("last_seen") or now)
+        existing = self.conn.execute(
+            "SELECT first_seen FROM peripherals WHERE id = ?", (pid,)
+        ).fetchone()
+        if existing:
+            first_seen = float(existing["first_seen"] or first_seen)
+            self.conn.execute(
+                "UPDATE peripherals SET kind=?, name=?, address=?, connected=?, available=?, "
+                "profile=?, facts=?, last_seen=? WHERE id=?",
+                (
+                    peripheral.get("kind") or "unknown",
+                    peripheral.get("name") or pid,
+                    peripheral.get("address") or "",
+                    1 if peripheral.get("connected") else 0,
+                    1 if peripheral.get("available", True) else 0,
+                    payload,
+                    facts,
+                    last_seen,
+                    pid,
+                ),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO peripherals (id, kind, name, address, connected, available, "
+                "profile, facts, first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    pid,
+                    peripheral.get("kind") or "unknown",
+                    peripheral.get("name") or pid,
+                    peripheral.get("address") or "",
+                    1 if peripheral.get("connected") else 0,
+                    1 if peripheral.get("available", True) else 0,
+                    payload,
+                    facts,
+                    first_seen,
+                    last_seen,
+                ),
+            )
+        self.conn.commit()
+
+    def get_peripheral(self, peripheral_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM peripherals WHERE id = ?", (peripheral_id,)
+        ).fetchone()
+        return self._peripheral_row(row) if row else None
+
+    def list_peripherals(self, kind: str | None = None) -> list[dict[str, Any]]:
+        if kind:
+            rows = self.conn.execute(
+                "SELECT * FROM peripherals WHERE kind = ? ORDER BY connected DESC, last_seen DESC",
+                (kind,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM peripherals ORDER BY connected DESC, kind, last_seen DESC"
+            ).fetchall()
+        return [self._peripheral_row(r) for r in rows]
+
+    def delete_peripheral(self, peripheral_id: str) -> bool:
+        cur = self.conn.execute("DELETE FROM peripherals WHERE id = ?", (peripheral_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    @staticmethod
+    def _peripheral_row(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        profile: dict[str, Any] = {}
+        try:
+            profile = json.loads(d.pop("profile", None) or "{}")
+        except json.JSONDecodeError:
+            profile = {}
+        if isinstance(profile, dict):
+            merged = {**profile}
+        else:
+            merged = {}
+        merged["id"] = d.get("id")
+        merged["kind"] = d.get("kind") or merged.get("kind")
+        merged["name"] = d.get("name") or merged.get("name")
+        merged["address"] = d.get("address") or merged.get("address") or ""
+        merged["connected"] = bool(d.get("connected"))
+        merged["available"] = bool(d.get("available"))
+        merged["first_seen"] = d.get("first_seen")
+        merged["last_seen"] = d.get("last_seen")
+        try:
+            facts = json.loads(d.get("facts") or "[]")
+        except json.JSONDecodeError:
+            facts = merged.get("facts") or []
+        merged["facts"] = facts if isinstance(facts, list) else []
+        return merged
 
     # --- Semantic memory ----------------------------------------------
     def add_memory(self, kind: str, text: str, embedding: list[float] | None = None) -> None:

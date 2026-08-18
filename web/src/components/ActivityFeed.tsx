@@ -83,6 +83,18 @@ function ActivityRow({ item }: { item: ActivityItem }) {
     );
   }
 
+  if (item.kind === "peripheral") {
+    return (
+      <div className={`act-card act-task ${item.ok === false ? "fail" : item.ok ? "ok" : ""}`}>
+        <div className="act-card-head">
+          <span className="badge badge-task">{item.state || "device"}</span>
+          <span className="act-task-text">{item.text}</span>
+          {item.name && <span className="act-task-id">{item.name}</span>}
+        </div>
+      </div>
+    );
+  }
+
   if (item.kind === "task") {
     const finished = item.state && item.state !== "running";
     return (

@@ -35,7 +35,8 @@ export type ActivityKind =
   | "tool_result"
   | "status"
   | "error"
-  | "task";
+  | "task"
+  | "peripheral";
 
 export interface ActivityItem {
   id: string;
@@ -77,6 +78,41 @@ export interface Device {
   updated_at: number;
 }
 
+export type PeripheralKind =
+  | "bluetooth"
+  | "usb"
+  | "audio"
+  | "display"
+  | "hid"
+  | "camera"
+  | "printer"
+  | "storage"
+  | "wifi"
+  | "network"
+  | "radio"
+  | string;
+
+export interface Peripheral {
+  id: string;
+  kind: PeripheralKind;
+  name: string;
+  address?: string;
+  vendor?: string;
+  product?: string;
+  serial?: string;
+  connected?: boolean;
+  paired?: boolean;
+  trusted?: boolean;
+  available?: boolean;
+  icon?: string;
+  control_hints?: string[];
+  identifiers?: Record<string, string>;
+  extra?: Record<string, unknown>;
+  facts?: string[];
+  first_seen?: number;
+  last_seen?: number;
+}
+
 export interface JarvisConfig {
   host: string;
   port: number;
@@ -111,6 +147,12 @@ export interface JarvisConfig {
     enabled: boolean;
     idle_minutes: number;
     min_interval_minutes: number;
+  };
+  device?: {
+    auto_learn?: boolean;
+    refresh_hours?: number;
+    scan_peripherals?: boolean;
+    peripheral_refresh_minutes?: number;
   };
   telegram?: {
     enabled: boolean;

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from .agent import Agent
 from .config import store
 from .device import init_learner, profile_summary
+from .peripherals import init_learner as init_peripheral_learner
 from .media import resolve_media_path
 from .memory import Memory
 from .rem import RemSleepService
@@ -26,6 +27,7 @@ from .tts import synthesize as tts_synthesize
 memory = Memory()
 task_manager = init_manager(memory)
 device_learner = init_learner(memory)
+peripheral_learner = init_peripheral_learner(memory)
 rem_service = RemSleepService(memory)
 _active_runs = 0
 _ws_clients: set[WebSocket] = set()
@@ -59,13 +61,17 @@ async def lifespan(app: FastAPI):
     rem_service.on_event(_broadcast)
     task_manager.on_event(_broadcast)
     device_learner.on_event(_broadcast)
+    peripheral_learner.on_event(_broadcast)
     task_manager.fail_orphans()
     if store.get().device.auto_learn:
         device_learner.start()
+        if store.get().device.scan_peripherals:
+            peripheral_learner.start()
     rem_service.start()
     await telegram_bot.start()
     yield
     device_learner.stop()
+    peripheral_learner.stop()
     await telegram_bot.stop()
     rem_service.stop()
 
@@ -101,11 +107,18 @@ async def update_config(update: ConfigUpdate) -> dict:
     if not isinstance(data, dict):
         raise HTTPException(400, "Invalid config payload")
     prev_tg = store.as_dict().get("telegram") or {}
+    prev_dev = store.as_dict().get("device") or {}
     store.update(data)
     new_tg = store.as_dict().get("telegram") or {}
+    new_dev = store.as_dict().get("device") or {}
     # Restart the bot when Telegram settings change (token / enable / allowlist).
     if _telegram_settings_changed(prev_tg, new_tg):
         await telegram_bot.reload()
+    if bool(prev_dev.get("scan_peripherals", True)) != bool(new_dev.get("scan_peripherals", True)):
+        if new_dev.get("scan_peripherals", True) and store.get().device.auto_learn:
+            peripheral_learner.start()
+        else:
+            peripheral_learner.stop()
     out = store.as_dict()
     _redact(out)
     return out
@@ -191,6 +204,79 @@ async def refresh_device() -> dict:
 
     profile = await device_learner.learn(llm=LLMClient(store.get().llm), reason="manual")
     return {"ok": True, "hostname": profile.get("hostname"), "summary": profile_summary(profile)}
+
+
+class PeripheralAction(BaseModel):
+    action: str = "connect"
+    command: str = ""
+    value: str = ""
+    password: str = ""
+    discover: bool = False
+    fact: str = ""
+
+
+@app.get("/api/peripherals")
+async def api_list_peripherals(kind: str | None = None) -> list[dict]:
+    items = peripheral_learner.items or memory.list_peripherals(kind)
+    if kind:
+        items = [p for p in items if p.get("kind") == kind]
+    return items
+
+
+@app.post("/api/peripherals/scan")
+async def api_scan_peripherals(body: PeripheralAction | None = None) -> dict:
+    from .llm import LLMClient
+
+    discover = bool(body.discover) if body else False
+    items = await peripheral_learner.scan(
+        llm=LLMClient(store.get().llm), reason="manual", discover=discover
+    )
+    return {
+        "ok": True,
+        "count": len([p for p in items if p.get("available", True)]),
+        "connected": sum(1 for p in items if p.get("connected")),
+        "peripherals": items,
+    }
+
+
+@app.get("/api/peripherals/{pid}")
+async def api_get_peripheral(pid: str) -> dict:
+    p = peripheral_learner.resolve(pid) or memory.get_peripheral(pid)
+    if p is None:
+        raise HTTPException(404, "Peripheral not found")
+    return p
+
+
+@app.post("/api/peripherals/{pid}/inspect")
+async def api_inspect_peripheral(pid: str) -> dict:
+    from .llm import LLMClient
+
+    p = await peripheral_learner.inspect(pid, llm=LLMClient(store.get().llm))
+    if p is None:
+        raise HTTPException(404, "Peripheral not found")
+    return p
+
+
+@app.post("/api/peripherals/{pid}/action")
+async def api_peripheral_action(pid: str, body: PeripheralAction) -> dict:
+    action = (body.action or "connect").strip().lower()
+    if action == "remember":
+        fact = (body.fact or body.value or "").strip()
+        if not fact:
+            raise HTTPException(400, "fact is required")
+        p = await peripheral_learner.remember_fact(pid, fact)
+        if p is None:
+            raise HTTPException(404, "Peripheral not found")
+        return {"ok": True, "peripheral": p}
+    command = action if action != "control" else (body.command or "").strip()
+    if not command:
+        raise HTTPException(400, "command is required")
+    ok, output, p = await peripheral_learner.act(
+        pid, command, value=body.value or "", password=body.password or ""
+    )
+    if p is None:
+        raise HTTPException(404, "Peripheral not found")
+    return {"ok": ok, "output": output, "peripheral": p}
 
 
 @app.get("/api/tasks")
@@ -344,6 +430,14 @@ async def chat_ws(ws: WebSocket) -> None:
             await emit({"type": "agent_end"})
         except Exception as exc:  # noqa: BLE001
             await emit({"type": "error", "message": f"Agent failure: {exc}"})
+            await emit({
+                "type": "assistant",
+                "text": (
+                    "Something went wrong on my side before I could finish that reply. "
+                    f"({exc})"
+                ),
+            })
+            await emit({"type": "status", "state": "idle"})
             await emit({"type": "agent_end"})
         finally:
             _active_runs = max(0, _active_runs - 1)

@@ -81,6 +81,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             idle_minutes: c.rem?.idle_minutes ?? 15,
             min_interval_minutes: c.rem?.min_interval_minutes ?? 60,
           },
+          device: {
+            auto_learn: c.device?.auto_learn ?? true,
+            refresh_hours: c.device?.refresh_hours ?? 6,
+            scan_peripherals: c.device?.scan_peripherals ?? true,
+            peripheral_refresh_minutes: c.device?.peripheral_refresh_minutes ?? 15,
+          },
           telegram: {
             enabled: c.telegram?.enabled ?? false,
             bot_token: c.telegram?.bot_token === "********" ? "" : c.telegram?.bot_token || "",
@@ -265,6 +271,12 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           enabled: cfg.rem?.enabled ?? true,
           idle_minutes: cfg.rem?.idle_minutes ?? 15,
           min_interval_minutes: cfg.rem?.min_interval_minutes ?? 60,
+        },
+        device: {
+          auto_learn: cfg.device?.auto_learn ?? true,
+          refresh_hours: cfg.device?.refresh_hours ?? 6,
+          scan_peripherals: cfg.device?.scan_peripherals ?? true,
+          peripheral_refresh_minutes: cfg.device?.peripheral_refresh_minutes ?? 15,
         },
         telegram: {
           enabled: cfg.telegram?.enabled ?? false,
@@ -768,7 +780,38 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             <h3>Known Devices ({devices.length})</h3>
             <p className="section-note">
               JARVIS learns this machine automatically on startup and refreshes periodically.
+              Attached peripherals (USB, Bluetooth, audio, displays, …) appear in the
+              Peripherals view and are re-scanned on a shorter interval.
             </p>
+            <label className="toggle-row">
+              <div className="toggle-copy">
+                <span className="toggle-title">Scan peripherals</span>
+                <span className="toggle-desc">
+                  Inventory USB, Bluetooth, audio, displays, cameras, printers, storage,
+                  and nearby networks on startup and on a short refresh interval.
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={cfg.device?.scan_peripherals ?? true}
+                onChange={(e) =>
+                  setCfg((c) =>
+                    c
+                      ? {
+                          ...c,
+                          device: {
+                            auto_learn: c.device?.auto_learn ?? true,
+                            refresh_hours: c.device?.refresh_hours ?? 6,
+                            scan_peripherals: e.target.checked,
+                            peripheral_refresh_minutes:
+                              c.device?.peripheral_refresh_minutes ?? 15,
+                          },
+                        }
+                      : c
+                  )
+                }
+              />
+            </label>
             <button
               type="button"
               className="btn btn-secondary"

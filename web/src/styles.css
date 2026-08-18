@@ -1901,8 +1901,123 @@ body {
   color: var(--text);
   word-break: break-word;
 }
-.act-task-id {
+.chip-peri.chip-on {
+  border-color: var(--cyan);
+  color: var(--cyan);
+  box-shadow: var(--glow);
+}
+.peri-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 12px 0 4px;
+}
+.peri-chip {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
   color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.peri-chip.on {
+  color: var(--cyan);
+  border-color: var(--line-strong);
+  box-shadow: var(--glow-soft);
+}
+.peri-error {
+  color: var(--danger);
+  font-size: 13px;
+  margin: 8px 0 0;
+}
+.peri-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.peri-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 12px 10px;
+}
+.peri-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-dim);
+}
+.peri-dot-connected {
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+}
+.peri-dot-paired {
+  background: var(--cyan);
+}
+.peri-dot-present {
+  background: var(--blue);
+}
+.peri-dot-offline {
+  background: var(--text-dim);
+  opacity: 0.5;
+}
+.peri-status-connected {
+  background: rgba(58, 255, 194, 0.14);
+  color: var(--ok);
+}
+.peri-status-paired {
+  background: rgba(56, 230, 255, 0.16);
+  color: var(--cyan);
+}
+.peri-status-present {
+  background: rgba(43, 123, 255, 0.18);
+  color: var(--cyan-soft);
+}
+.peri-status-offline {
+  background: rgba(111, 139, 173, 0.16);
+  color: var(--text-dim);
+}
+.peri-card.peri-connected {
+  border-color: rgba(58, 255, 194, 0.35);
+}
+.peri-card.peri-offline {
+  opacity: 0.65;
+}
+.peri-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+}
+.peri-meta em {
+  font-style: normal;
+  color: var(--cyan-soft);
+  margin-right: 6px;
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+.peri-hints {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  color: var(--text);
+  font-size: 12px;
+}
+.peri-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--cyan-soft);
+  font-size: 12px;
+}
+.peri-facts p {
+  margin: 0;
 }

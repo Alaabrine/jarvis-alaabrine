@@ -5,6 +5,7 @@ import type {
   Conversation,
   Device,
   JarvisConfig,
+  Peripheral,
   RemStatus,
 } from "./types";
 
@@ -111,6 +112,33 @@ export const api = {
     fetch(`${API}/api/devices/refresh`, { method: "POST" }).then((r) =>
       json<{ ok: boolean; hostname: string; summary: string }>(r)
     ),
+
+  listPeripherals: (kind?: string) =>
+    fetch(
+      `${API}/api/peripherals${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`
+    ).then((r) => json<Peripheral[]>(r)),
+  scanPeripherals: (discover = false) =>
+    fetch(`${API}/api/peripherals/scan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ discover }),
+    }).then((r) =>
+      json<{ ok: boolean; count: number; connected: number; peripherals: Peripheral[] }>(r)
+    ),
+  inspectPeripheral: (id: string) =>
+    fetch(`${API}/api/peripherals/${encodeURIComponent(id)}/inspect`, {
+      method: "POST",
+    }).then((r) => json<Peripheral>(r)),
+  peripheralAction: (
+    id: string,
+    action: string,
+    extra: { command?: string; value?: string; password?: string; fact?: string } = {}
+  ) =>
+    fetch(`${API}/api/peripherals/${encodeURIComponent(id)}/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...extra }),
+    }).then((r) => json<{ ok: boolean; output?: string; peripheral?: Peripheral }>(r)),
 
   /** Synthesize JARVIS butler speech; returns an audio/mpeg Blob. */
   tts: (text: string, signal?: AbortSignal) =>

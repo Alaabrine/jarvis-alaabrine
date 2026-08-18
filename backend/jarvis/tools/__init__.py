@@ -2,18 +2,20 @@
 
 JARVIS uses a small set of universal tools instead of many explicit per-action tools.
 The agent learns the device autonomously on startup and controls it via device_control.
+Peripherals (USB, Bluetooth, audio, …) are inventoried separately via the peripherals tool.
 """
 
 from __future__ import annotations
 
 from .base import Tool, ToolContext, ToolResult
-from . import browse, communicate, device_control, remember, tasks
+from . import browse, communicate, device_control, peripherals, remember, tasks
 
 
 def all_tools() -> list[Tool]:
     """Return every registered tool instance."""
     return [
         device_control.device_control,
+        peripherals.peripherals,
         browse.browse,
         communicate.communicate,
         remember.remember,

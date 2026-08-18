@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -30,6 +31,17 @@ class ChatMessage:
     content: str = ""
     reasoning: str = ""
     tool_calls: list[Any] = field(default_factory=list)
+
+
+def _looks_complete_json(raw: str) -> bool:
+    text = (raw or "").strip()
+    if not text:
+        return False
+    try:
+        json.loads(text)
+        return True
+    except json.JSONDecodeError:
+        return False
 
 
 def split_thinking(text: str) -> tuple[str, str]:
@@ -143,6 +155,8 @@ class LLMClient:
                 kwargs["tool_choice"] = tool_choice or "auto"
             try:
                 return await self._stream_once(client, kwargs, on_delta, cancel)
+            except Interrupted:
+                raise
             except APIConnectionError as exc:
                 last_error = exc
                 continue
@@ -168,6 +182,7 @@ class LLMClient:
         tool_acc: dict[int, dict[str, str]] = {}
         prev_reasoning = ""
         prev_visible = ""
+        stream_error: Exception | None = None
 
         try:
             async for chunk in stream:
@@ -211,6 +226,12 @@ class LLMClient:
                             slot["name"] = tc.function.name
                         if tc.function.arguments:
                             slot["arguments"] += tc.function.arguments
+        except Interrupted:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Keep whatever tokens arrived so the agent can wrap up instead of
+            # dying mid-thought with no chat reply (dropped SSE, local-server cutoffs).
+            stream_error = exc
         finally:
             # Best-effort close so the upstream request stops when interrupted.
             close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
@@ -222,6 +243,9 @@ class LLMClient:
                 except Exception:  # noqa: BLE001
                     pass
 
+        if stream_error and not (raw_content or reasoning_extra or tool_acc):
+            raise LLMError(f"LLM stream ended: {stream_error}") from stream_error
+
         tagged_reasoning, visible = split_thinking(raw_content)
         reasoning = "\n\n".join(p for p in (reasoning_extra.strip(), tagged_reasoning) if p)
 
@@ -229,6 +253,10 @@ class LLMClient:
         for idx in sorted(tool_acc):
             slot = tool_acc[idx]
             if not slot["name"] and not slot["arguments"]:
+                continue
+            # A dropped stream often leaves a half-written tool call; skip those so
+            # the agent wraps up instead of executing garbage arguments.
+            if stream_error and (not slot["name"] or not _looks_complete_json(slot["arguments"])):
                 continue
             tool_calls.append(
                 type(

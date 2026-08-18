@@ -261,7 +261,9 @@ class RemSleepService:
 
     def _phase_light(self) -> list[str]:
         """Stage recent short-term conversation / device memories."""
-        rows = self.memory.list_memories(kinds=["conversation", "device", "short_term"], limit=80)
+        rows = self.memory.list_memories(
+            kinds=["conversation", "device", "peripheral", "short_term"], limit=80
+        )
         staged: list[str] = []
         seen: set[str] = set()
         for row in rows:

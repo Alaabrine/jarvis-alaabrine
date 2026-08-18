@@ -133,8 +133,8 @@ device_control = Tool(
         "shell (run any command — primary way to control the machine), "
         "read/write/list/move/delete (files), "
         "open (launch an app or URL). "
-        "Prefer shell with the correct utility for volume, brightness, Wi-Fi, services, "
-        "packages, etc. Do not ask the user to scan the system first."
+        "Prefer shell with the correct utility for services, packages, and anything not "
+        "covered by the peripherals tool. Do not ask the user to scan the system first."
     ),
     parameters={
         "action": prop(

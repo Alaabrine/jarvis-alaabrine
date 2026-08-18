@@ -4,6 +4,7 @@ A self-hosted, butler-style AI agent inspired by JARVIS from Iron Man.
 
 - **Local-first LLM** via [Odysseus](https://odysseus-dev.github.io/odysseus/) (any OpenAI-compatible endpoint), with a cloud API fallback.
 - **Full device control**: JARVIS learns your machine autonomously on startup (hardware, OS, desktop, control utilities) and acts on natural-language requests via unified control — no need to pick explicit tools or run a system scan.
+- **Peripherals**: detects USB, Bluetooth, audio, displays, cameras, printers, storage, Wi-Fi and LAN/mDNS neighbours; can inspect/learn them, connect or pair, and control volume, brightness, mount, and media.
 - **Full internet access**: web search + page reading so it can learn to answer your prompts.
 - **Persistent memory**: chat sessions, activity monitor history, and device profiles survive restarts; REM sleep consolidates short-term memories when idle.
 - **Neon-tech web UI** streaming everything JARVIS is thinking and doing in real time.
@@ -124,12 +125,19 @@ export JARVIS_STT_COMPUTE_TYPE="int8"   # or float16 on GPU
 
 ### Device learning
 
-JARVIS profiles the host automatically on startup (hardware, desktop, control utilities):
+JARVIS profiles the host automatically on startup (hardware, desktop, control utilities)
+and inventories attached / nearby peripherals:
 
 ```bash
 export JARVIS_DEVICE_AUTO_LEARN=true    # default true
-export JARVIS_DEVICE_REFRESH_HOURS=6    # periodic re-scan
+export JARVIS_DEVICE_REFRESH_HOURS=6    # periodic host re-scan
+export JARVIS_SCAN_PERIPHERALS=true     # USB, Bluetooth, audio, displays, …
+export JARVIS_PERIPHERAL_REFRESH_MINUTES=15
 ```
+
+Ask it to list headphones, connect a Bluetooth device, set a speaker as default, or
+inspect a USB camera. The **Peripherals** chip in the header shows the live inventory;
+**Discover** runs a Bluetooth inquiry for unpaired nearby devices.
 
 
 
@@ -180,11 +188,11 @@ faster-whisper. Restart the desktop app after changing hotkey env vars.
 You ──▶ Web/Desktop UI ──WebSocket──▶ Agent loop ──▶ LLM (Odysseus local / cloud fallback)
  │                                       │
  └──▶ Telegram bot (long-poll) ──────────┤
-                                         ├──▶ Tools: device_control, browse, communicate, remember, tasks
-                                         └──▶ Memory: SQLite + autonomous device profiles + recall
+                                         ├──▶ Tools: device_control, peripherals, browse, communicate, remember, tasks
+                                         └──▶ Memory: SQLite + autonomous device/peripheral profiles + recall
 ```
 
-On startup JARVIS autonomously profiles the host (CPU, RAM, disks, desktop environment, package managers, audio/display/network utilities) and injects control hints into every conversation. Ask it to dim the screen, connect Wi-Fi, install a package, or open an app — it picks the right shell command from what it already knows. Use `remember` to persist newly discovered control methods.
+On startup JARVIS autonomously profiles the host (CPU, RAM, disks, desktop environment, package managers, audio/display/network utilities) and scans for peripherals (USB, Bluetooth, audio sinks, displays, cameras, printers, storage, Wi-Fi, mDNS). Control hints are injected into every conversation. Ask it to dim the screen, connect headphones, join Wi-Fi, install a package, or open an app — it picks the right tool from what it already knows. Use `remember` (or `peripherals remember`) to persist newly discovered control methods.
 
 The agent streams every step (reasoning, tool calls, results) to the Activity Monitor.
 Chat and activity are saved per session (delete a session or Clear the monitor independently).
