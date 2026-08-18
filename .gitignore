@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+backend/.venv/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+*.tsbuildinfo
+
+# Tauri / Rust
+target/
+desktop/src-tauri/target/
+
+# Env & data
+.env
+*.db
+.jarvis/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
