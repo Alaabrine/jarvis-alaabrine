@@ -111,6 +111,16 @@ class PermissionsConfig:
 
 
 @dataclass
+class DeviceConfig:
+    """Autonomous device learning — profile the host on startup and refresh periodically."""
+
+    auto_learn: bool = field(default_factory=lambda: _env_bool("JARVIS_DEVICE_AUTO_LEARN", True))
+    refresh_hours: float = field(
+        default_factory=lambda: float(_env("JARVIS_DEVICE_REFRESH_HOURS", default="6"))
+    )
+
+
+@dataclass
 class RemConfig:
     """Inactivity-triggered REM memory consolidation (OpenClaw-style dreaming)."""
 
@@ -183,6 +193,7 @@ class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     email_accounts: EmailAccounts = field(default_factory=_default_email_accounts)
     permissions: PermissionsConfig = field(default_factory=PermissionsConfig)
+    device: DeviceConfig = field(default_factory=DeviceConfig)
     rem: RemConfig = field(default_factory=RemConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
     stt: SttConfig = field(default_factory=SttConfig)
@@ -255,6 +266,15 @@ class ConfigStore:
                             setattr(cfg.permissions, k, bool(v))
                         else:
                             setattr(cfg.permissions, k, v)
+            elif key == "device" and isinstance(value, dict):
+                for k, v in value.items():
+                    if hasattr(cfg.device, k):
+                        if k == "auto_learn":
+                            setattr(cfg.device, k, bool(v))
+                        elif k == "refresh_hours":
+                            setattr(cfg.device, k, float(v))
+                        else:
+                            setattr(cfg.device, k, v)
             elif key == "rem" and isinstance(value, dict):
                 for k, v in value.items():
                     if hasattr(cfg.rem, k):

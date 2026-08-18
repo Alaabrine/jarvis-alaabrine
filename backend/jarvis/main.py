@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from .agent import Agent
 from .config import store
+from .device import init_learner, profile_summary
 from .media import resolve_media_path
 from .memory import Memory
 from .rem import RemSleepService
@@ -24,6 +25,7 @@ from .tts import synthesize as tts_synthesize
 
 memory = Memory()
 task_manager = init_manager(memory)
+device_learner = init_learner(memory)
 rem_service = RemSleepService(memory)
 _active_runs = 0
 _ws_clients: set[WebSocket] = set()
@@ -56,10 +58,14 @@ async def lifespan(app: FastAPI):
 
     rem_service.on_event(_broadcast)
     task_manager.on_event(_broadcast)
+    device_learner.on_event(_broadcast)
     task_manager.fail_orphans()
+    if store.get().device.auto_learn:
+        device_learner.start()
     rem_service.start()
     await telegram_bot.start()
     yield
+    device_learner.stop()
     await telegram_bot.stop()
     rem_service.stop()
 
@@ -176,6 +182,15 @@ async def delete_activity(cid: int) -> dict:
 @app.get("/api/devices")
 async def list_devices() -> list[dict]:
     return memory.list_devices()
+
+
+@app.post("/api/devices/refresh")
+async def refresh_device() -> dict:
+    """Re-scan the host device and update the learned profile."""
+    from .llm import LLMClient
+
+    profile = await device_learner.learn(llm=LLMClient(store.get().llm), reason="manual")
+    return {"ok": True, "hostname": profile.get("hostname"), "summary": profile_summary(profile)}
 
 
 @app.get("/api/tasks")

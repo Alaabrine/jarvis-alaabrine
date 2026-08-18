@@ -8,6 +8,7 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 from .config import Config
+from .device import get_learner
 from .llm import Interrupted, LLMClient, LLMError
 from .memory import Memory
 from .persona import system_prompt
@@ -121,9 +122,16 @@ class Agent:
             recalled = self.memory.recall(user_text, query_embedding)
         devices = self.memory.list_devices()
         context_parts = list(recalled)
-        for d in devices[:3]:
-            context_parts.append(f"Known device: {d['name']} ({d['profile'].get('os','?')})")
-        memory_context = "\n".join(f"- {c}" for c in context_parts)
+        learner = get_learner()
+        device_ctx = learner.get_context() if learner else ""
+        if device_ctx:
+            context_parts.insert(0, device_ctx)
+        else:
+            for d in devices[:3]:
+                context_parts.append(f"Known device: {d['name']} ({d['profile'].get('os','?')})")
+        memory_context = "\n".join(
+            c if c.startswith("===") else f"- {c}" for c in context_parts
+        )
 
         system = system_prompt(self.config.user_name, memory_context, self.config)
         if fresh_media:

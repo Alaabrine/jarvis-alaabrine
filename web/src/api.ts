@@ -107,6 +107,11 @@ export const api = {
 
   listDevices: () => fetch(`${API}/api/devices`).then((r) => json<Device[]>(r)),
 
+  refreshDevice: () =>
+    fetch(`${API}/api/devices/refresh`, { method: "POST" }).then((r) =>
+      json<{ ok: boolean; hostname: string; summary: string }>(r)
+    ),
+
   /** Synthesize JARVIS butler speech; returns an audio/mpeg Blob. */
   tts: (text: string, signal?: AbortSignal) =>
     fetch(`${API}/api/tts`, {

@@ -1,28 +1,22 @@
-"""Tool registry for JARVIS."""
+"""Tool registry for JARVIS.
+
+JARVIS uses a small set of universal tools instead of many explicit per-action tools.
+The agent learns the device autonomously on startup and controls it via device_control.
+"""
 
 from __future__ import annotations
 
 from .base import Tool, ToolContext, ToolResult
-from . import apps, email_tool, files, shell, system, tasks, web
+from . import browse, communicate, device_control, remember, tasks
 
 
 def all_tools() -> list[Tool]:
     """Return every registered tool instance."""
     return [
-        web.web_search,
-        web.web_fetch,
-        files.read_file,
-        files.list_dir,
-        files.write_file,
-        files.move_path,
-        files.delete_path,
-        shell.run_shell,
-        apps.open_app,
-        apps.open_url,
-        email_tool.send_email,
-        email_tool.read_email,
-        email_tool.list_email_profiles,
-        system.system_scan,
+        device_control.device_control,
+        browse.browse,
+        communicate.communicate,
+        remember.remember,
         tasks.start_task,
         tasks.run_background_shell,
         tasks.check_task,

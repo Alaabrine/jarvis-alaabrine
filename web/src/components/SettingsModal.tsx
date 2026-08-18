@@ -57,6 +57,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
   const [saved, setSaved] = useState(false);
   const [remRunning, setRemRunning] = useState(false);
   const [remNote, setRemNote] = useState("");
+  const [deviceRefreshing, setDeviceRefreshing] = useState(false);
   const [activeProfileId, setActiveProfileId] = useState<string>("default");
 
   useEffect(() => {
@@ -533,7 +534,7 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             <h3>Email profiles</h3>
             <p className="section-note">
               Configure multiple mailboxes. JARVIS uses the default unless you ask for a profile by
-              name or id (tools: list_email_profiles, send_email, read_email).
+              name or id (tool: communicate with mode=list_profiles / send / read).
             </p>
             <div className="email-profile-bar">
               <select
@@ -765,7 +766,26 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
 
           <section className="settings-section">
             <h3>Known Devices ({devices.length})</h3>
-            {devices.length === 0 && <p className="section-note">Ask JARVIS to "scan this device" to register it.</p>}
+            <p className="section-note">
+              JARVIS learns this machine automatically on startup and refreshes periodically.
+            </p>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              disabled={deviceRefreshing}
+              onClick={() => {
+                setDeviceRefreshing(true);
+                api
+                  .refreshDevice()
+                  .then(() => api.listDevices().then(setDevices))
+                  .finally(() => setDeviceRefreshing(false));
+              }}
+            >
+              {deviceRefreshing ? "Refreshing…" : "Refresh device profile"}
+            </button>
+            {devices.length === 0 && (
+              <p className="section-note">No profile yet — start the backend or click Refresh.</p>
+            )}
             {devices.map((d) => (
               <div key={d.id} className="device-row">
                 <span className="device-name">{d.name}</span>
