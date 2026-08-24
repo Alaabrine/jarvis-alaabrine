@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -426,6 +427,15 @@ class Memory:
         return merged
 
     # --- Semantic memory ----------------------------------------------
+    def has_memory(self, kind: str, text: str) -> bool:
+        """Is this exact note already stored? Used to keep periodic re-scans from
+        duplicating rows (and from paying for a redundant embedding)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM memories WHERE kind = ? AND text = ? LIMIT 1",
+            (kind, text),
+        ).fetchone()
+        return row is not None
+
     def add_memory(self, kind: str, text: str, embedding: list[float] | None = None) -> None:
         self.conn.execute(
             "INSERT INTO memories (kind, text, embedding, created_at) VALUES (?, ?, ?, ?)",
@@ -434,58 +444,192 @@ class Memory:
         self.conn.commit()
 
     def list_memories(
-        self, kinds: list[str] | None = None, limit: int = 50
+        self,
+        kinds: list[str] | None = None,
+        query: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
         if kinds:
             placeholders = ",".join("?" * len(kinds))
-            rows = self.conn.execute(
-                f"SELECT id, kind, text, created_at FROM memories WHERE kind IN ({placeholders}) "
-                f"ORDER BY id DESC LIMIT ?",
-                (*kinds, limit),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT id, kind, text, created_at FROM memories ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            clauses.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        q = (query or "").strip()
+        if q:
+            clauses.append("text LIKE ?")
+            params.append(f"%{q}%")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT id, kind, text, created_at FROM memories{where} "
+            f"ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
         return [dict(r) for r in rows]
+
+    def count_memories(self, kinds: list[str] | None = None, query: str | None = None) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            clauses.append(f"kind IN ({placeholders})")
+            params.extend(kinds)
+        q = (query or "").strip()
+        if q:
+            clauses.append("text LIKE ?")
+            params.append(f"%{q}%")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.conn.execute(f"SELECT COUNT(*) AS n FROM memories{where}", params).fetchone()
+        return int(row["n"]) if row else 0
+
+    def memory_stats(self) -> dict[str, Any]:
+        rows = self.conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM memories GROUP BY kind ORDER BY n DESC"
+        ).fetchall()
+        by_kind = {str(r["kind"]): int(r["n"]) for r in rows}
+        return {"total": sum(by_kind.values()), "by_kind": by_kind}
+
+    def delete_memory(self, memory_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete_memories(self, memory_ids: list[int]) -> int:
+        ids = [int(i) for i in memory_ids if int(i) > 0]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        cur = self.conn.execute(
+            f"DELETE FROM memories WHERE id IN ({placeholders})", ids
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def wipe_memories(self, kinds: list[str] | None = None) -> int:
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            cur = self.conn.execute(
+                f"DELETE FROM memories WHERE kind IN ({placeholders})", kinds
+            )
+        else:
+            cur = self.conn.execute("DELETE FROM memories")
+        self.conn.commit()
+        return cur.rowcount
 
     def recall(
         self, query: str, query_embedding: list[float] | None = None, limit: int = 6
     ) -> list[str]:
-        # Prefer long-term consolidated memories, then everything else.
+        """Return memories relevant to *query* only.
+
+        Long-term memory is kept, but nothing is injected when relevance is weak.
+        Episodic conversation notes need a higher bar than durable facts so past
+        chats cannot hijack an unrelated turn.
+        """
         rows = self.conn.execute(
             "SELECT text, embedding, kind FROM memories ORDER BY "
-            "CASE kind WHEN 'long_term' THEN 0 WHEN 'rem_theme' THEN 1 ELSE 2 END, id DESC"
+            "CASE kind WHEN 'long_term' THEN 0 WHEN 'rem_theme' THEN 1 "
+            "WHEN 'device' THEN 2 WHEN 'peripheral' THEN 2 WHEN 'device_control' THEN 2 "
+            "ELSE 3 END, id DESC"
         ).fetchall()
         if not rows:
             return []
 
         if query_embedding:
             scored: list[tuple[float, str]] = []
+            seen: set[str] = set()
             for r in rows:
                 if not r["embedding"]:
                     continue
-                emb = json.loads(r["embedding"])
-                boost = 0.08 if r["kind"] == "long_term" else 0.0
-                scored.append((_cosine(query_embedding, emb) + boost, r["text"]))
+                try:
+                    emb = json.loads(r["embedding"])
+                except json.JSONDecodeError:
+                    continue
+                sim = _cosine(query_embedding, emb)
+                kind = (r["kind"] or "").strip()
+                floor = _RECALL_COSINE_EPISODIC if kind in _EPISODIC_KINDS else _RECALL_COSINE_MIN
+                if sim < floor:
+                    continue
+                boost = 0.05 if kind in _DURABLE_KINDS else 0.0
+                text = (r["text"] or "").strip()
+                if not text:
+                    continue
+                key = text[:160].lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                scored.append((sim + boost, text))
             if scored:
                 scored.sort(key=lambda x: x[0], reverse=True)
                 return [t for _, t in scored[:limit]]
 
-        terms = {w.lower() for w in query.split() if len(w) > 3}
-        scored_kw: list[tuple[int, str]] = []
+        terms = _query_terms(query)
+        if not terms:
+            return []
+
+        scored_kw: list[tuple[float, str]] = []
+        seen_kw: set[str] = set()
         for r in rows:
-            text = r["text"]
-            overlap = sum(1 for t in terms if t in text.lower())
-            if r["kind"] == "long_term":
-                overlap += 1
-            scored_kw.append((overlap, text))
+            text = (r["text"] or "").strip()
+            if not text:
+                continue
+            low = text.lower()
+            kind = (r["kind"] or "").strip()
+            hits = sum(1 for t in terms if t in low)
+            if hits <= 0:
+                continue
+            # Episodic notes need at least two distinct query terms (or one strong
+            # token) so common words alone cannot drag in an old chat.
+            if kind in _EPISODIC_KINDS and hits < 2 and not any(len(t) >= 6 for t in terms if t in low):
+                continue
+            score = float(hits)
+            if kind in _DURABLE_KINDS:
+                score += 0.5
+            key = text[:160].lower()
+            if key in seen_kw:
+                continue
+            seen_kw.add(key)
+            scored_kw.append((score, text))
         scored_kw.sort(key=lambda x: x[0], reverse=True)
-        top = [t for score, t in scored_kw if score > 0][:limit]
-        if top:
-            return top
-        return [r["text"] for r in rows[:limit]]
+        return [t for _, t in scored_kw[:limit]]
+
+
+# Recalled notes that are chat transcripts / REM staging — require tighter match.
+_EPISODIC_KINDS = frozenset({"conversation", "staged", "short_term"})
+_DURABLE_KINDS = frozenset(
+    {"long_term", "device", "peripheral", "device_control", "preference", "fact"}
+)
+_RECALL_COSINE_MIN = 0.36
+_RECALL_COSINE_EPISODIC = 0.48
+
+_RECALL_STOPWORDS = frozenset(
+    {
+        "what", "with", "that", "this", "have", "from", "your", "about", "would",
+        "could", "should", "there", "their", "where", "when", "which", "into",
+        "than", "then", "them", "these", "those", "just", "like", "some", "more",
+        "also", "only", "very", "much", "make", "made", "want", "need", "tell",
+        "know", "please", "thanks", "thank", "jarvis", "asked", "answered",
+        "user", "does", "doing", "done", "will", "shall", "here", "help",
+        "open", "show", "give", "take", "come", "back", "again", "thing",
+        "things", "something", "anything", "everything", "nothing", "other",
+        "after", "before", "while", "still", "being", "been", "were", "was",
+        "are", "can", "cant", "dont", "didnt", "isnt", "wasnt", "werent",
+    }
+)
+
+
+def _query_terms(query: str) -> set[str]:
+    """Content tokens from the user query — skip stopwords and tiny glue words."""
+    terms: set[str] = set()
+    for raw in re.findall(r"[a-zA-Z0-9][a-zA-Z0-9_-]{1,}", query or ""):
+        w = raw.lower().strip("_-")
+        if len(w) < 3 or w in _RECALL_STOPWORDS:
+            continue
+        # Keep short technical tokens (mcp, rgb, api, …); drop other 3-letter glue.
+        if len(w) == 3 and w.isalpha() and w not in {"mcp", "rgb", "api", "gpu", "cpu", "usb", "ssd", "hdd", "vpn", "ssh", "sql", "cli", "gui", "url", "app"}:
+            continue
+        terms.add(w)
+    return terms
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

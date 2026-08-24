@@ -26,13 +26,14 @@ export function Sidebar({
         <span>{online ? "Core online" : "Core offline"}</span>
       </div>
 
-      <button className="new-btn" onClick={onNew}>
-        <span className="plus">+</span> New session
+      <button className="new-btn" onClick={onNew} title="Start a fresh briefing">
+        <span className="plus">+</span> New briefing
       </button>
 
+      <p className="sidebar-label">Archives</p>
       <nav className="conv-list">
         {conversations.length === 0 && (
-          <p className="empty-hint">No sessions yet. Start a conversation.</p>
+          <p className="empty-hint">No prior sessions. Speak when you are ready.</p>
         )}
         {conversations.map((c) => (
           <div
@@ -55,8 +56,8 @@ export function Sidebar({
         ))}
       </nav>
 
-      <button className="settings-btn" onClick={onOpenSettings}>
-        ⚙ Configuration
+      <button className="settings-btn" onClick={onOpenSettings} title="Systems configuration">
+        Systems
       </button>
     </aside>
   );

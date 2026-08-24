@@ -32,6 +32,32 @@ DREAMS_STATE = DATA_DIR / "memory" / ".dreams"
 PHASE_SIGNALS = DREAMS_STATE / "phase-signals.json"
 
 
+def read_memory_files() -> dict[str, str]:
+    """Return consolidated long-term markdown files for the memory bank UI."""
+    out: dict[str, str] = {}
+    for path, key in ((MEMORY_MD, "memory_md"), (DREAMS_MD, "dreams_md")):
+        try:
+            out[key] = path.read_text(encoding="utf-8") if path.is_file() else ""
+        except OSError:
+            out[key] = ""
+    return out
+
+
+def wipe_memory_files() -> None:
+    """Clear consolidated markdown memory files."""
+    for path in (MEMORY_MD, DREAMS_MD):
+        try:
+            if path.is_file():
+                path.write_text("", encoding="utf-8")
+        except OSError:
+            log.warning("Failed to wipe %s", path)
+    try:
+        if PHASE_SIGNALS.is_file():
+            PHASE_SIGNALS.unlink()
+    except OSError:
+        log.warning("Failed to remove phase signals")
+
+
 @dataclass
 class RemStatus:
     enabled: bool = True
@@ -310,6 +336,7 @@ class RemSleepService:
             "You are consolidating JARVIS short-term memories during REM sleep.\n"
             "From the notes below, extract 3-8 recurring themes or durable facts about the user, "
             "their devices, preferences, or ongoing projects.\n"
+            "Skip one-off commands (open a URL, launch an app) unless they clearly recur.\n"
             "Return ONLY a JSON array of short strings. No markdown.\n\n"
             f"Notes:\n{corpus}"
         )
@@ -343,6 +370,8 @@ class RemSleepService:
         # Reinforce staged lines that overlap themes.
         theme_terms = {w.lower() for t in themes for w in re.findall(r"[a-zA-Z]{4,}", t)}
         for s in staged:
+            if _is_ephemeral_memory_line(s):
+                continue
             score = sum(1 for w in theme_terms if w in s.lower())
             if score >= 2 or len(s) > 80 and score >= 1:
                 candidates.append(s)
@@ -352,6 +381,8 @@ class RemSleepService:
         seen: set[str] = set()
         existing = self._read_memory_md()
         for c in candidates:
+            if _is_ephemeral_memory_line(c):
+                continue
             norm = re.sub(r"\s+", " ", c.strip().lower())
             if len(norm) < 20 or norm in seen:
                 continue
@@ -442,9 +473,24 @@ def _parse_json_string_list(raw: str) -> list[str]:
 def _heuristic_themes(staged: list[str]) -> list[str]:
     freq: dict[str, int] = {}
     for s in staged:
+        if _is_ephemeral_memory_line(s):
+            # Still count terms for recurrence detection, but skip promoting the raw line.
+            pass
         for w in re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", s.lower()):
-            if w in {"user", "asked", "jarvis", "answered", "this", "that", "with", "from", "have"}:
+            if w in {"user", "asked", "jarvis", "answered", "this", "that", "with", "from", "have", "interest", "open", "please"}:
                 continue
             freq[w] = freq.get(w, 0) + 1
     top = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:8]
     return [f"Recurring interest: {w} (seen {n}×)" for w, n in top if n >= 2][:6]
+
+
+def _is_ephemeral_memory_line(text: str) -> bool:
+    """One-off chat actions — fine for dreaming, not for durable MEMORY.md."""
+    low = (text or "").strip().lower()
+    if not low:
+        return True
+    if low.startswith("user asked:") or low.startswith("user interest:"):
+        return True
+    if re.match(r"^(open|launch|go to|visit)\b", low):
+        return True
+    return False

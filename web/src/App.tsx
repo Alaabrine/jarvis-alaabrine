@@ -9,6 +9,7 @@ import type {
   ChatMessage,
   ConfirmationRequest,
   Conversation,
+  McpStatus,
   Peripheral,
   RemLogEntry,
   RemStatus,
@@ -17,11 +18,16 @@ import { Sidebar } from "./components/Sidebar";
 import { ChatPanel } from "./components/ChatPanel";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { ConfirmModal } from "./components/ConfirmModal";
-import { SettingsModal } from "./components/SettingsModal";
+import { SettingsModal, type SystemsSection } from "./components/SettingsModal";
 import { StatusOrb } from "./components/StatusOrb";
 import { RemSleepView } from "./components/RemSleepView";
 import { TasksView } from "./components/TasksView";
 import { PeripheralsView } from "./components/PeripheralsView";
+import { McpView } from "./components/McpView";
+import { MemoryView } from "./components/MemoryView";
+import { HudOverlay } from "./components/HudOverlay";
+import { BOOT_KEY, SystemsBoot } from "./components/SystemsBoot";
+import type { BriefingStatus } from "./components/WelcomeBriefing";
 
 let activitySeq = 0;
 const nextId = () => `a${Date.now()}-${activitySeq++}`;
@@ -35,15 +41,20 @@ export default function App() {
   const [agentState, setAgentState] = useState<AgentState>("idle");
   const [online, setOnline] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SystemsSection>("overview");
   const [voiceReplies, setVoiceReplies] = useState(true);
   const [remStatus, setRemStatus] = useState<RemStatus | null>(null);
   const [remLogs, setRemLogs] = useState<RemLogEntry[]>([]);
   const [remViewOpen, setRemViewOpen] = useState(false);
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
-  const [view, setView] = useState<"console" | "tasks" | "peripherals">("console");
+  const [view, setView] = useState<"console" | "tasks" | "peripherals" | "mcp" | "memory">("console");
+  const [memoryCount, setMemoryCount] = useState(0);
   const [peripherals, setPeripherals] = useState<Peripheral[]>([]);
+  const [mcpStatus, setMcpStatus] = useState<McpStatus | null>(null);
   const [periScanning, setPeriScanning] = useState(false);
   const [periError, setPeriError] = useState("");
+  const [briefing, setBriefing] = useState<BriefingStatus | null>(null);
+  const [bootOpen, setBootOpen] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const currentIdRef = useRef<number | null>(null);
@@ -67,6 +78,29 @@ export default function App() {
     stop: useCallback(() => voiceRef.current.stopPushToTalk(), []),
   });
 
+  function refreshBriefing() {
+    api
+      .getConfig()
+      .then((c) => {
+        const mail = c.email_accounts?.profiles?.find((p) => p.id === c.email_accounts?.default_id) || c.email;
+        const emailReady = Boolean(mail?.smtp_host && (mail?.from_address || mail?.smtp_user));
+        const telegramReady = Boolean(
+          c.telegram?.enabled && (c.telegram?.bot_token_configured || (c.telegram?.bot_token && c.telegram.bot_token !== "********"))
+        );
+        setBriefing({
+          userName: c.user_name || "Sir",
+          model: c.llm?.prefer === "cloud" ? c.llm.fallback_model || c.llm.model : c.llm?.model || "",
+          prefer: c.llm?.prefer || "local",
+          telegramReady,
+          emailReady,
+          peripheralCount: peripherals.length,
+          connectedPeripherals: peripherals.filter((p) => p.connected).length,
+          mcpTools: mcpStatus?.imported_tool_count ?? 0,
+        });
+      })
+      .catch(() => {});
+  }
+
   // --- Load conversations + rem status on mount ---
   useEffect(() => {
     void refreshConversations();
@@ -74,7 +108,61 @@ export default function App() {
     api.remStatus().then(setRemStatus).catch(() => {});
     api.listTasks().then(setTasks).catch(() => {});
     api.listPeripherals().then(setPeripherals).catch(() => {});
+    api.mcpStatus().then(setMcpStatus).catch(() => {});
+    api.memoryStats().then((s) => setMemoryCount(s.total)).catch(() => {});
+    refreshBriefing();
+    try {
+      if (localStorage.getItem(BOOT_KEY) !== "1") {
+        api
+          .listConversations()
+          .then((list) => {
+            if (list.length === 0) setBootOpen(true);
+            else localStorage.setItem(BOOT_KEY, "1");
+          })
+          .catch(() => {});
+      }
+    } catch {
+      /* ignore */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    setBriefing((prev) =>
+      prev
+        ? {
+            ...prev,
+            peripheralCount: peripherals.length,
+            connectedPeripherals: peripherals.filter((p) => p.connected).length,
+            mcpTools: mcpStatus?.imported_tool_count ?? prev.mcpTools,
+          }
+        : prev
+    );
+  }, [peripherals, mcpStatus]);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (confirmations.length > 0) return;
+      if (bootOpen) return;
+      if (settingsOpen) {
+        setSettingsOpen(false);
+        e.preventDefault();
+        return;
+      }
+      if (remViewOpen) {
+        setRemViewOpen(false);
+        e.preventDefault();
+        return;
+      }
+      if (view !== "console") {
+        setView("console");
+        e.preventDefault();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [confirmations.length, bootOpen, settingsOpen, remViewOpen, view]);
 
   // Persist activity monitor (debounced) per session
   useEffect(() => {
@@ -85,6 +173,10 @@ export default function App() {
     }, 700);
     return () => window.clearTimeout(timer);
   }, [activity, currentId]);
+
+  function refreshMemoryCount() {
+    api.memoryStats().then((s) => setMemoryCount(s.total)).catch(() => {});
+  }
 
   async function refreshConversations() {
     try {
@@ -284,6 +376,37 @@ export default function App() {
         setMessages((prev) => [...prev, { role: "assistant", content: evt.text }]);
         if (voiceReplies) voiceRef.current.speak(stripForSpeech(evt.text));
         break;
+      case "suggestions": {
+        const items = Array.isArray(evt.items) ? evt.items : [];
+        if (!items.length) break;
+        setMessages((prev) => {
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].role === "assistant" && !prev[i].working) {
+              const copy = [...prev];
+              copy[i] = { ...copy[i], suggestions: items };
+              return copy;
+            }
+          }
+          return prev;
+        });
+        break;
+      }
+      case "say":
+        if (evt.text) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: evt.text, working: true },
+          ]);
+          if (voiceReplies) voiceRef.current.speak(stripForSpeech(evt.text));
+        }
+        break;
+      case "steered":
+        pushActivity({
+          kind: "status",
+          state: "steered",
+          text: evt.text || "",
+        });
+        break;
       case "tool_call":
         pushActivity({
           kind: "tool_call",
@@ -319,7 +442,13 @@ export default function App() {
       case "confirmation_request":
         setConfirmations((prev) => [
           ...prev,
-          { id: evt.id, name: evt.name, args: evt.args, preview: evt.preview },
+          {
+            id: evt.id,
+            name: evt.name,
+            args: evt.args,
+            preview: evt.preview,
+            risk: evt.risk,
+          },
         ]);
         break;
       case "error":
@@ -343,11 +472,12 @@ export default function App() {
           ];
         });
         setMessages((prev) => {
+          const stopLine = evt.message || "Very well — I'll stop there.";
           const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.content === "Very well — interrupted.") {
+          if (last?.role === "assistant" && last.content === stopLine) {
             return prev;
           }
-          return [...prev, { role: "assistant", content: "Very well — interrupted." }];
+          return [...prev, { role: "assistant", content: stopLine }];
         });
         voiceRef.current.stopSpeaking();
         break;
@@ -503,6 +633,7 @@ export default function App() {
   ) {
     const trimmed = text.trim();
     if (!trimmed && attachments.length === 0) return;
+    voiceRef.current.stopSpeaking();
     setRemViewOpen(false);
     setView("console");
     void api.remWake().then(setRemStatus).catch(() => {});
@@ -646,8 +777,24 @@ export default function App() {
     }
   }
 
+  function openSystems(section: SystemsSection = "overview") {
+    setSettingsSection(section);
+    setSettingsOpen(true);
+  }
+
+  function askFromSystems(prompt: string) {
+    setSettingsOpen(false);
+    setView("console");
+    void sendMessage(prompt, []);
+  }
+
+  function toggleView(next: typeof view) {
+    setView((v) => (v === next ? "console" : next));
+  }
+
   const runningTasks = tasks.filter((t) => t.status === "running").length;
   const connectedPeripherals = peripherals.filter((p) => p.connected).length;
+  const importedMcpTools = mcpStatus?.imported_tool_count ?? 0;
 
   const remDreaming =
     !!remStatus && (remStatus.running || remStatus.phase !== "awake");
@@ -661,7 +808,7 @@ export default function App() {
         onSelect={selectConversation}
         onNew={newConversation}
         onDelete={removeConversation}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => openSystems("overview")}
         online={online}
       />
 
@@ -677,26 +824,42 @@ export default function App() {
           <div className="topbar-actions">
             {voice.pttActive && (
               <span className="chip chip-on chip-ptt" title="Release Super+` to send">
-                PTT Listening
+                Listening
               </span>
             )}
             <button
               type="button"
               className={`chip chip-tasks ${runningTasks > 0 || view === "tasks" ? "chip-on" : ""}`}
-              title="Show subagents and background tasks"
-              onClick={() => setView((v) => (v === "tasks" ? "console" : "tasks"))}
+              title="Background operations and subagents"
+              onClick={() => toggleView("tasks")}
             >
-              {runningTasks > 0 ? `Subagents · ${runningTasks}` : "Subagents"}
+              {runningTasks > 0 ? `Operations · ${runningTasks}` : "Operations"}
             </button>
             <button
               type="button"
               className={`chip chip-peri ${connectedPeripherals > 0 || view === "peripherals" ? "chip-on" : ""}`}
-              title="Detected peripherals"
-              onClick={() => setView((v) => (v === "peripherals" ? "console" : "peripherals"))}
+              title="Devices and peripherals"
+              onClick={() => toggleView("peripherals")}
             >
               {connectedPeripherals > 0
-                ? `Peripherals · ${connectedPeripherals}`
-                : "Peripherals"}
+                ? `Devices · ${connectedPeripherals}`
+                : "Devices"}
+            </button>
+            <button
+              type="button"
+              className={`chip chip-memory ${memoryCount > 0 || view === "memory" ? "chip-on" : ""}`}
+              title="What I remember"
+              onClick={() => toggleView("memory")}
+            >
+              {memoryCount > 0 ? `Memory · ${memoryCount}` : "Memory"}
+            </button>
+            <button
+              type="button"
+              className={`chip chip-mcp ${importedMcpTools > 0 || view === "mcp" ? "chip-on" : ""}`}
+              title="Imported tools and MCP connections"
+              onClick={() => toggleView("mcp")}
+            >
+              {importedMcpTools > 0 ? `Connections · ${importedMcpTools}` : "Connections"}
             </button>
             {remDreaming && (
               <button
@@ -724,9 +887,17 @@ export default function App() {
                 setVoiceReplies((v) => !v);
                 voiceRef.current.stopSpeaking();
               }}
-              title="Toggle spoken replies"
+              title="Spoken replies, including while JARVIS is working"
             >
-              {voiceReplies ? "Voice On" : "Voice Off"}
+              {voiceReplies ? "Voice" : "Muted"}
+            </button>
+            <button
+              type="button"
+              className={`chip ${settingsOpen ? "chip-on" : ""}`}
+              title="Systems configuration"
+              onClick={() => openSystems("overview")}
+            >
+              Systems
             </button>
             <span className="state-label">
               {remDreaming ? `Dreaming · ${remStatus?.phase}` : stateLabel(agentState)}
@@ -734,28 +905,7 @@ export default function App() {
           </div>
         </header>
 
-        {view === "tasks" ? (
-          <TasksView
-            tasks={tasks}
-            onCancel={cancelTask}
-            onDelete={deleteTask}
-            onBack={() => setView("console")}
-          />
-        ) : view === "peripherals" ? (
-          <PeripheralsView
-            peripherals={peripherals}
-            scanning={periScanning}
-            lastError={periError}
-            onScan={(discover) => void scanPeripherals(discover)}
-            onInspect={(id) => void inspectPeripheral(id)}
-            onAction={(id, action) => void peripheralAction(id, action)}
-            onAsk={(prompt) => {
-              setView("console");
-              void sendMessage(prompt, []);
-            }}
-            onBack={() => setView("console")}
-          />
-        ) : (
+        <div className="workspace-wrap">
           <div className="workspace">
             <ChatPanel
               messages={messages}
@@ -763,6 +913,9 @@ export default function App() {
               onSend={sendMessage}
               onInterrupt={interrupt}
               voice={voice}
+              briefing={briefing}
+              onOpenSystems={() => openSystems("overview")}
+              onOpenDevices={() => toggleView("peripherals")}
             />
             <ActivityFeed
               items={activity}
@@ -770,8 +923,65 @@ export default function App() {
               onClear={clearActivityMonitor}
             />
           </div>
-        )}
+          {view === "tasks" && (
+            <HudOverlay onClose={() => setView("console")}>
+              <TasksView
+                tasks={tasks}
+                onCancel={cancelTask}
+                onDelete={deleteTask}
+                onBack={() => setView("console")}
+              />
+            </HudOverlay>
+          )}
+          {view === "mcp" && (
+            <HudOverlay onClose={() => setView("console")}>
+              <McpView
+                onBack={() => setView("console")}
+                onSaved={() => {
+                  api.mcpStatus().then(setMcpStatus).catch(() => {});
+                }}
+              />
+            </HudOverlay>
+          )}
+          {view === "memory" && (
+            <HudOverlay onClose={() => setView("console")}>
+              <MemoryView
+                onBack={() => {
+                  setView("console");
+                  refreshMemoryCount();
+                }}
+              />
+            </HudOverlay>
+          )}
+          {view === "peripherals" && (
+            <HudOverlay onClose={() => setView("console")}>
+              <PeripheralsView
+                peripherals={peripherals}
+                scanning={periScanning}
+                lastError={periError}
+                onScan={(discover) => void scanPeripherals(discover)}
+                onInspect={(id) => void inspectPeripheral(id)}
+                onAction={(id, action) => void peripheralAction(id, action)}
+                onAsk={(prompt) => {
+                  setView("console");
+                  void sendMessage(prompt, []);
+                }}
+                onBack={() => setView("console")}
+              />
+            </HudOverlay>
+          )}
+        </div>
       </main>
+
+      {bootOpen && (
+        <SystemsBoot
+          speak={voiceReplies ? (text) => voiceRef.current.speak(text) : undefined}
+          onDone={() => {
+            setBootOpen(false);
+            refreshBriefing();
+          }}
+        />
+      )}
 
       {remViewOpen && remStatus && (
         <RemSleepView
@@ -787,7 +997,20 @@ export default function App() {
       {confirmations.length > 0 && (
         <ConfirmModal request={confirmations[0]} onAnswer={answerConfirmation} />
       )}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsModal
+          initialSection={settingsSection}
+          onClose={() => {
+            setSettingsOpen(false);
+            refreshBriefing();
+          }}
+          onAsk={askFromSystems}
+          onOpenMemoryBank={() => {
+            setSettingsOpen(false);
+            setView("memory");
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -809,5 +1032,5 @@ function stripForSpeech(text: string): string {
   return text
     .replace(/```[\s\S]*?```/g, " (code block) ")
     .replace(/[*_`#>]/g, "")
-    .slice(0, 700);
+    .slice(0, 480);
 }

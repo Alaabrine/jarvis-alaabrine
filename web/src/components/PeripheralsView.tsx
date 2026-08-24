@@ -104,11 +104,11 @@ export function PeripheralsView({
     <section className="tasks-view peri-view">
       <div className="tasks-view-head">
         <div className="tasks-view-title">
-          <h2>Peripherals</h2>
+          <h2>Devices</h2>
           <span className="tasks-view-sub">
             {present === 0
-              ? "No devices inventoried yet — run a scan."
-              : `${present} present · ${connected} connected. JARVIS learns how to control them.`}
+              ? "No devices inventoried yet — I can scan, or you can ask me what's connected."
+              : `${present} present · ${connected} connected. Ask me to pair, inspect, or control any of them.`}
           </span>
         </div>
         <div className="tasks-view-stats">
@@ -136,7 +136,7 @@ export function PeripheralsView({
             Discover
           </button>
           <button type="button" className="btn btn-ghost" onClick={onBack}>
-            Back to console
+            Close
           </button>
         </div>
       </div>

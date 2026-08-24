@@ -24,6 +24,8 @@ class ToolContext:
 class ToolResult:
     ok: bool
     output: str
+    # Optional OpenAI-style vision parts (image_url) for the next LLM turn.
+    images: list[dict[str, Any]] | None = None
 
 
 DangerFn = Callable[[dict[str, Any]], bool]

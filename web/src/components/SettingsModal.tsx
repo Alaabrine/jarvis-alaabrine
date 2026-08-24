@@ -1,6 +1,54 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { Device, EmailProfile, JarvisConfig, RemStatus } from "../types";
+import type { Device, EmailProfile, JarvisConfig, MemoryStats, RemStatus } from "../types";
+
+export type SystemsSection =
+  | "overview"
+  | "identity"
+  | "brain"
+  | "permissions"
+  | "memory"
+  | "mail"
+  | "phone"
+  | "tools"
+  | "hardware";
+
+const SECTIONS: { id: SystemsSection; label: string }[] = [
+  { id: "overview", label: "All systems" },
+  { id: "identity", label: "Identity" },
+  { id: "brain", label: "Mind" },
+  { id: "permissions", label: "Authorisation" },
+  { id: "memory", label: "Memory" },
+  { id: "mail", label: "Mail" },
+  { id: "phone", label: "Phone" },
+  { id: "tools", label: "Tools" },
+  { id: "hardware", label: "Hardware" },
+];
+
+const LLM_PRESETS = [
+  {
+    id: "odysseus",
+    label: "Odysseus / Ollama",
+    prefer: "local" as const,
+    base_url: "http://localhost:11434/v1",
+    model: "qwen2.5:latest",
+    api_key: "local",
+  },
+  {
+    id: "openai",
+    label: "OpenAI",
+    prefer: "cloud" as const,
+    fallback_base_url: "https://api.openai.com/v1",
+    fallback_model: "gpt-4o-mini",
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    prefer: "cloud" as const,
+    fallback_base_url: "https://openrouter.ai/api/v1",
+    fallback_model: "openai/gpt-4o-mini",
+  },
+];
 
 function emptyProfile(id?: string): EmailProfile {
   const pid = id || `profile-${Date.now().toString(36)}`;
@@ -49,16 +97,32 @@ function normalizeAccounts(c: JarvisConfig): JarvisConfig["email_accounts"] {
   return { default_id, profiles };
 }
 
-export function SettingsModal({ onClose }: { onClose: () => void }) {
+export function SettingsModal({
+  onClose,
+  onOpenMemoryBank,
+  onAsk,
+  initialSection = "overview",
+}: {
+  onClose: () => void;
+  onOpenMemoryBank?: () => void;
+  onAsk?: (prompt: string) => void;
+  initialSection?: SystemsSection;
+}) {
   const [cfg, setCfg] = useState<JarvisConfig | null>(null);
   const [devices, setDevices] = useState<Device[]>([]);
   const [remStatus, setRemStatus] = useState<RemStatus | null>(null);
+  const [memoryStats, setMemoryStats] = useState<MemoryStats | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [remRunning, setRemRunning] = useState(false);
   const [remNote, setRemNote] = useState("");
+  const [memoryWiping, setMemoryWiping] = useState(false);
+  const [memoryNote, setMemoryNote] = useState("");
+  const [confirmWipeMemory, setConfirmWipeMemory] = useState(false);
   const [deviceRefreshing, setDeviceRefreshing] = useState(false);
   const [activeProfileId, setActiveProfileId] = useState<string>("default");
+  const [section, setSection] = useState<SystemsSection>(initialSection);
+  const [showEmbeddings, setShowEmbeddings] = useState(false);
 
   useEffect(() => {
     api
@@ -95,19 +159,34 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             allowed_user_ids: c.telegram?.allowed_user_ids ?? [],
             notify_tools: c.telegram?.notify_tools ?? true,
           },
+          mcp: {
+            enabled: c.mcp?.enabled ?? true,
+            servers: (c.mcp?.servers ?? []).map((s) => ({
+              ...s,
+              headers: Object.fromEntries(
+                Object.entries(s.headers ?? {}).map(([k, v]) => [k, v === "********" ? "" : v])
+              ),
+              headers_configured: s.headers_configured,
+              env: Object.fromEntries(
+                Object.entries(s.env ?? {}).map(([k, v]) => [k, v === "********" ? "" : v])
+              ),
+              env_configured: s.env_configured,
+            })),
+          },
         });
         setActiveProfileId(email_accounts.default_id);
       })
       .catch(() => {});
     api.listDevices().then(setDevices).catch(() => {});
     api.remStatus().then(setRemStatus).catch(() => {});
+    api.memoryStats().then(setMemoryStats).catch(() => {});
   }, []);
 
   if (!cfg) {
     return (
       <div className="modal-overlay" onClick={onClose}>
         <div className="modal" onClick={(e) => e.stopPropagation()}>
-          <p>Loading configuration…</p>
+          <p>Bringing systems online…</p>
         </div>
       </div>
     );
@@ -285,6 +364,31 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           allowed_user_ids: cfg.telegram?.allowed_user_ids ?? [],
           notify_tools: cfg.telegram?.notify_tools ?? true,
         },
+        mcp: {
+          enabled: cfg.mcp?.enabled ?? true,
+          servers: (cfg.mcp?.servers ?? []).map((s) => ({
+            id: s.id,
+            name: s.name,
+            url: s.url,
+            enabled: s.enabled,
+            headers: Object.fromEntries(
+              Object.entries(s.headers ?? {})
+                .filter(([k, v]) => k.trim() && (v || s.headers_configured))
+                .map(([k, v]) => [k, v || "********"])
+            ),
+            // Local (stdio) servers JARVIS installed itself: pass these through, or
+            // saving settings would unconfigure them.
+            transport: s.transport ?? (s.command ? "stdio" : "http"),
+            command: s.command ?? "",
+            args: s.args ?? [],
+            env: Object.fromEntries(
+              Object.entries(s.env ?? {})
+                .filter(([k, v]) => k.trim() && (v || s.env_configured))
+                .map(([k, v]) => [k, v || "********"])
+            ),
+            cwd: s.cwd ?? "",
+          })),
+        },
       });
       const refreshed = await api.getConfig();
       const email_accounts = normalizeAccounts(refreshed);
@@ -338,19 +442,184 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
     }
   }
 
+  async function wipeAllMemory() {
+    setMemoryWiping(true);
+    setMemoryNote("");
+    try {
+      const res = await api.wipeMemories({ include_files: true });
+      setMemoryNote(`Wiped ${res.deleted} memories and cleared consolidated files.`);
+      setConfirmWipeMemory(false);
+      const stats = await api.memoryStats();
+      setMemoryStats(stats);
+    } catch (err) {
+      setMemoryNote(err instanceof Error ? err.message : "Memory wipe failed");
+    } finally {
+      setMemoryWiping(false);
+    }
+  }
+
   const isDefault = activeProfile.id === cfg.email_accounts.default_id;
+  const mailReady = Boolean(
+    activeProfile.smtp_host && (activeProfile.from_address || activeProfile.smtp_user)
+  );
+  const phoneReady = Boolean(
+    cfg.telegram?.enabled &&
+      (cfg.telegram.bot_token_configured || (cfg.telegram.bot_token && cfg.telegram.bot_token !== "********"))
+  );
+  const brainLabel =
+    cfg.llm.prefer === "cloud"
+      ? `Cloud · ${cfg.llm.fallback_model || "unset"}`
+      : `Local · ${cfg.llm.model || "unset"}`;
+
+  function applyPreset(preset: (typeof LLM_PRESETS)[number]) {
+    setCfg((c) => {
+      if (!c) return c;
+      if (preset.prefer === "local") {
+        return {
+          ...c,
+          llm: {
+            ...c.llm,
+            prefer: "local",
+            base_url: preset.base_url,
+            model: preset.model,
+            api_key: preset.api_key || c.llm.api_key,
+          },
+        };
+      }
+      return {
+        ...c,
+        llm: {
+          ...c.llm,
+          prefer: "cloud",
+          fallback_base_url: preset.fallback_base_url || c.llm.fallback_base_url,
+          fallback_model: preset.fallback_model || c.llm.fallback_model,
+        },
+      };
+    });
+    setSection("brain");
+  }
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal settings-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <h2>Configuration</h2>
+          <div>
+            <h2>Systems</h2>
+            <p className="settings-head-sub">Tell me what you need, or adjust a subsystem here.</p>
+          </div>
           <button className="modal-close" onClick={onClose}>
             ×
           </button>
         </div>
 
-        <div className="settings-scroll">
+        <div className="settings-body">
+          <nav className="settings-nav" aria-label="Systems">
+            {SECTIONS.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                className={`settings-nav-item ${section === s.id ? "on" : ""}`}
+                onClick={() => setSection(s.id)}
+              >
+                {s.label}
+              </button>
+            ))}
+          </nav>
+
+          <div className="settings-scroll">
+            {section === "overview" && (
+              <section className="settings-section">
+                <h3>Status</h3>
+                <p className="section-note">
+                  I am already listening. Configure only what you need — or ask me to walk you through it.
+                </p>
+                <div className="systems-grid">
+                  <button type="button" className="sys-card" onClick={() => setSection("identity")}>
+                    <span className="sys-card-dot on" />
+                    <strong>Identity</strong>
+                    <span>{cfg.user_name || "Sir"}</span>
+                  </button>
+                  <button type="button" className="sys-card" onClick={() => setSection("brain")}>
+                    <span className="sys-card-dot on" />
+                    <strong>Mind</strong>
+                    <span>{brainLabel}</span>
+                  </button>
+                  <button type="button" className="sys-card" onClick={() => setSection("permissions")}>
+                    <span className={`sys-card-dot ${cfg.permissions?.auto_approve ? "warn" : "on"}`} />
+                    <strong>Authorisation</strong>
+                    <span>{cfg.permissions?.auto_approve ? "Auto-approve on" : "Irreversible only"}</span>
+                  </button>
+                  <button type="button" className="sys-card" onClick={() => setSection("memory")}>
+                    <span className={`sys-card-dot ${cfg.rem?.enabled ? "on" : "off"}`} />
+                    <strong>Memory</strong>
+                    <span>
+                      {cfg.rem?.enabled ? "REM sleep on" : "REM off"}
+                      {memoryStats ? ` · ${memoryStats.total} facts` : ""}
+                    </span>
+                  </button>
+                  <button type="button" className="sys-card" onClick={() => setSection("mail")}>
+                    <span className={`sys-card-dot ${mailReady ? "on" : "off"}`} />
+                    <strong>Mail</strong>
+                    <span>{mailReady ? activeProfile.name || "Ready" : "Not configured"}</span>
+                  </button>
+                  <button type="button" className="sys-card" onClick={() => setSection("phone")}>
+                    <span className={`sys-card-dot ${phoneReady ? "on" : "off"}`} />
+                    <strong>Phone</strong>
+                    <span>{phoneReady ? "Telegram ready" : "Not linked"}</span>
+                  </button>
+                  <button type="button" className="sys-card" onClick={() => setSection("tools")}>
+                    <span className={`sys-card-dot ${cfg.mcp?.enabled ? "on" : "off"}`} />
+                    <strong>Tools</strong>
+                    <span>{cfg.mcp?.enabled ? "MCP endpoint on" : "MCP off"}</span>
+                  </button>
+                  <button type="button" className="sys-card" onClick={() => setSection("hardware")}>
+                    <span className={`sys-card-dot ${devices.length ? "on" : ""}`} />
+                    <strong>Hardware</strong>
+                    <span>{devices.length ? `${devices.length} profile${devices.length === 1 ? "" : "s"}` : "Learning…"}</span>
+                  </button>
+                </div>
+                {onAsk && (
+                  <div className="systems-ask">
+                    <p className="section-note">Prefer to talk? I can set this up with you.</p>
+                    <div className="settings-row-actions">
+                      {!mailReady && (
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          onClick={() =>
+                            onAsk("Walk me through setting up email so you can send and read messages for me.")
+                          }
+                        >
+                          Set up mail
+                        </button>
+                      )}
+                      {!phoneReady && (
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          onClick={() =>
+                            onAsk("Walk me through connecting Telegram so I can talk to you from my phone. Keep it simple.")
+                          }
+                        >
+                          Link my phone
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        onClick={() =>
+                          onAsk("Find useful MCP servers for me and install the ones I should have.")
+                        }
+                      >
+                        Add tools
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
+
+            {section === "identity" && (
           <section className="settings-section">
             <h3>Identity</h3>
             <Field label="Address me as">
@@ -367,22 +636,40 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               />
             </Field>
             <p className="section-note">
-              Hold Super+` anywhere to dictate a prompt; release to send. Requires the
-              desktop app. Restart the desktop shell after changing hotkeys (or set
-              JARVIS_HOTKEY / JARVIS_PTT_HOTKEY).
+              Hold Super+` anywhere to speak to me. Requires the desktop app. Restart it
+              after changing hotkeys.
             </p>
           </section>
+            )}
 
+            {section === "brain" && (
+              <>
           <section className="settings-section">
-            <h3>Language Model</h3>
+            <h3>Mind</h3>
+            <p className="section-note">
+              Where I think. Local is Odysseus / Ollama / vLLM on this machine. Cloud is
+              an API I use if you prefer it, or if local is unreachable.
+            </p>
+            <div className="preset-row">
+              {LLM_PRESETS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={() => applyPreset(p)}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
             <Field label="Prefer">
               <select value={cfg.llm.prefer} onChange={(e) => setLLM("prefer", e.target.value)}>
-                <option value="local">Local (Odysseus)</option>
+                <option value="local">This machine (local)</option>
                 <option value="cloud">Cloud API</option>
               </select>
             </Field>
             <p className="section-note">
-              Primary endpoint — point this at Odysseus / Ollama / vLLM / llama.cpp.
+              Local endpoint — Odysseus, Ollama, vLLM, or llama.cpp.
             </p>
             <Field label="Base URL">
               <input value={cfg.llm.base_url} onChange={(e) => setLLM("base_url", e.target.value)} placeholder="http://localhost:11434/v1" />
@@ -407,27 +694,40 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           </section>
 
           <section className="settings-section">
-            <h3>Embeddings (optional)</h3>
-            <p className="section-note">Enables semantic memory recall. Any OpenAI-compatible embeddings endpoint.</p>
+            <h3>
+              <button type="button" className="advanced-toggle" onClick={() => setShowEmbeddings((v) => !v)}>
+                {showEmbeddings ? "Hide" : "Show"} embeddings (optional)
+              </button>
+            </h3>
+            {showEmbeddings && (
+              <>
+            <p className="section-note">Semantic memory recall. Any OpenAI-compatible embeddings endpoint.</p>
             <Field label="Embedding base URL">
               <input value={cfg.llm.embedding_base_url} onChange={(e) => setLLM("embedding_base_url", e.target.value)} />
             </Field>
             <Field label="Embedding model">
               <input value={cfg.llm.embedding_model} onChange={(e) => setLLM("embedding_model", e.target.value)} />
             </Field>
+              </>
+            )}
           </section>
+              </>
+            )}
 
+            {section === "permissions" && (
           <section className="settings-section">
-            <h3>Permissions</h3>
+            <h3>Authorisation</h3>
             <p className="section-note">
-              Controls how JARVIS handles gated actions and privileged shell commands.
-              The sudo password is stored only in your local config (~/.jarvis/config.json).
+              Most actions run immediately. I only pause for irreversible work: deleting
+              or overwriting files, shutting down or rebooting, and sending email. A saved
+              sudo password lets me run privileged commands without asking. Your sudo
+              password stays on this machine, in ~/.jarvis/config.json.
             </p>
             <label className="toggle-row">
               <div className="toggle-copy">
-                <span className="toggle-title">Auto-approve gated actions</span>
+                <span className="toggle-title">Auto-approve irreversible actions</span>
                 <span className="toggle-desc">
-                  Skip Approve/Deny prompts for destructive tools (shell writes, delete, email, etc.).
+                  Skip Approve/Deny even for delete, overwrite, shutdown/reboot, and email.
                 </span>
               </div>
               <input
@@ -474,16 +774,19 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </button>
             )}
             <p className="section-note warn-note">
-              Granting sudo and auto-approve gives JARVIS broad control of this machine. Use only on
-              a trusted local host.
+              Granting sudo and auto-approve gives me broad control of this machine. Use only on
+              a host you trust.
             </p>
           </section>
+            )}
 
+            {section === "memory" && (
+              <>
           <section className="settings-section">
-            <h3>REM sleep (memory consolidation)</h3>
+            <h3>REM sleep</h3>
             <p className="section-note">
-              After idle time with no chat, JARVIS runs light → REM → deep cycles to promote short-term
-              memories into long-term notes (~/.jarvis/MEMORY.md, DREAMS.md), similar to OpenClaw.
+              When you leave me idle, I consolidate short-term memories into long-term notes
+              (~/.jarvis/MEMORY.md, DREAMS.md).
             </p>
             <label className="toggle-row">
               <div className="toggle-copy">
@@ -535,19 +838,94 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
           </section>
 
           <section className="settings-section">
-            <h3>Web Search (optional)</h3>
+            <h3>Memory bank</h3>
+            <p className="section-note">
+              Semantic facts JARVIS recalls during chat — preferences, device notes, conversation
+              summaries, and REM-consolidated long-term memory. Browse, delete individual entries,
+              or wipe everything.
+            </p>
+            {memoryStats && (
+              <p className="section-note">
+                <strong>{memoryStats.total}</strong> stored memor{memoryStats.total === 1 ? "y" : "ies"}
+                {memoryStats.has_memory_md ? " · MEMORY.md present" : ""}
+                {memoryStats.has_dreams_md ? " · DREAMS.md present" : ""}
+              </p>
+            )}
+            <div className="settings-row-actions">
+              {onOpenMemoryBank && (
+                <button type="button" className="btn btn-ghost" onClick={onOpenMemoryBank}>
+                  Open memory bank
+                </button>
+              )}
+              {!confirmWipeMemory ? (
+                <button
+                  type="button"
+                  className="btn btn-danger-outline"
+                  disabled={memoryWiping}
+                  onClick={() => setConfirmWipeMemory(true)}
+                >
+                  Wipe all memory
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-danger"
+                    disabled={memoryWiping}
+                    onClick={() => void wipeAllMemory()}
+                  >
+                    {memoryWiping ? "Wiping…" : "Confirm wipe everything"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    disabled={memoryWiping}
+                    onClick={() => setConfirmWipeMemory(false)}
+                  >
+                    Cancel
+                  </button>
+                </>
+              )}
+            </div>
+            {confirmWipeMemory && (
+              <p className="section-note warn-note">
+                This permanently deletes all semantic memories and clears MEMORY.md / DREAMS.md.
+                JARVIS will forget learned facts until new ones are recorded.
+              </p>
+            )}
+            {memoryNote && <p className="section-note">{memoryNote}</p>}
+          </section>
+              </>
+            )}
+
+            {section === "brain" && (
+          <section className="settings-section">
+            <h3>Web search</h3>
             <Field label="SearXNG URL">
               <input value={cfg.searxng_url} onChange={(e) => setTop("searxng_url", e.target.value)} placeholder="http://localhost:8080" />
             </Field>
-            <p className="section-note">Leave blank to use the built-in DuckDuckGo fallback.</p>
+            <p className="section-note">Leave blank — I will use DuckDuckGo.</p>
           </section>
+            )}
 
+            {section === "mail" && (
           <section className="settings-section">
-            <h3>Email profiles</h3>
+            <h3>Mail</h3>
             <p className="section-note">
-              Configure multiple mailboxes. JARVIS uses the default unless you ask for a profile by
-              name or id (tool: communicate with mode=list_profiles / send / read).
+              I send and read mail from these mailboxes. Ask for a profile by name, or I use the default.
+              {onAsk ? " Prefer a walkthrough? Ask me to set this up." : ""}
             </p>
+            {onAsk && (
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() =>
+                  onAsk("Walk me through setting up email so you can send and read messages for me.")
+                }
+              >
+                Walk me through this
+              </button>
+            )}
             <div className="email-profile-bar">
               <select
                 value={activeProfile.id}
@@ -692,14 +1070,27 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </Field>
             </div>
           </section>
+            )}
 
+            {section === "phone" && (
           <section className="settings-section">
-            <h3>Telegram</h3>
+            <h3>Phone</h3>
             <p className="section-note">
-              Chat with JARVIS from your phone. The bot long-polls Telegram outbound — your API
-              stays on localhost. Create a bot with @BotFather, enable it here, then message the bot
-              /whoami and add your chat_id or user_id to the allowlist.
+              Talk to me from Telegram. I long-poll outbound — this machine stays private.
+              Create a bot with @BotFather, enable it here, message /whoami, then add your
+              chat id to the allowlist.
             </p>
+            {onAsk && (
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() =>
+                  onAsk("Walk me through connecting Telegram so I can talk to you from my phone. Keep it simple.")
+                }
+              >
+                Walk me through this
+              </button>
+            )}
             <label className="toggle-row">
               <div className="toggle-copy">
                 <span className="toggle-title">Enable Telegram bot</span>
@@ -771,17 +1162,64 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
             </label>
             <p className="section-note warn-note">
               Anyone on the allowlist can run the same tools as the web UI (files, shell, email).
-              Keep the list short. Destructive actions still ask Approve / Deny in Telegram unless
+              Keep the list short. Irreversible actions still ask Approve / Deny in Telegram unless
               auto-approve is on.
             </p>
           </section>
+            )}
 
+            {section === "tools" && (
           <section className="settings-section">
-            <h3>Known Devices ({devices.length})</h3>
+            <h3>Tools</h3>
             <p className="section-note">
-              JARVIS learns this machine automatically on startup and refreshes periodically.
-              Attached peripherals (USB, Bluetooth, audio, displays, …) appear in the
-              Peripherals view and are re-scanned on a shorter interval.
+              Other apps can talk to me at <code>/mcp</code>. Use <strong>Connections</strong> in
+              the header to browse and install servers — or just ask me to add the tools you need.
+            </p>
+            {onAsk && (
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() =>
+                  onAsk("Find useful MCP servers for me and install the ones I should have.")
+                }
+              >
+                Find tools for me
+              </button>
+            )}
+            <label className="toggle-row">
+              <div className="toggle-copy">
+                <span className="toggle-title">Enable MCP endpoint</span>
+                <span className="toggle-desc">
+                  Lets external MCP clients call JARVIS tools over Streamable HTTP.
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={cfg.mcp?.enabled ?? true}
+                onChange={(e) =>
+                  setCfg((c) =>
+                    c
+                      ? {
+                          ...c,
+                          mcp: {
+                            enabled: e.target.checked,
+                            servers: c.mcp?.servers ?? [],
+                          },
+                        }
+                      : c
+                  )
+                }
+              />
+            </label>
+          </section>
+            )}
+
+            {section === "hardware" && (
+          <section className="settings-section">
+            <h3>Hardware</h3>
+            <p className="section-note">
+              I learn this machine on startup. Attached devices appear under Devices — ask me
+              what's connected, or to pair headphones, dim the display, or join Wi-Fi.
             </p>
             <label className="toggle-row">
               <div className="toggle-copy">
@@ -839,12 +1277,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </div>
             ))}
           </section>
+            )}
+          </div>
         </div>
 
         <div className="settings-footer">
           {saved && <span className="saved-note">Saved.</span>}
           <button className="btn btn-primary" onClick={save} disabled={saving}>
-            {saving ? "Saving…" : "Save configuration"}
+            {saving ? "Saving…" : "Save systems"}
           </button>
         </div>
       </div>

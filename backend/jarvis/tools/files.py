@@ -1,4 +1,4 @@
-"""File system tools. Reads are automatic; writes/moves/deletes require confirmation."""
+"""File system tools. Reads and new-file writes run immediately; overwrite, move, and delete require confirmation."""
 
 from __future__ import annotations
 

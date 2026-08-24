@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -59,6 +61,7 @@ KIND_ORDER = (
     "audio",
     "display",
     "hid",
+    "lighting",
     "camera",
     "printer",
     "storage",
@@ -66,6 +69,32 @@ KIND_ORDER = (
     "network",
     "radio",
 )
+
+_LIGHTING_COMMANDS = {
+    "lighting",
+    "light",
+    "lights",
+    "rgb",
+    "led",
+    "backlight",
+    "rainbow",
+    "spectrum",
+    "wave",
+    "static",
+    "breathing",
+    "off",
+    "on",
+}
+
+_EFFECT_ALIASES = {
+    "rainbow": ["rainbow", "Rainbow Wave", "spectrum", "Spectrum Cycle", "wave"],
+    "spectrum": ["spectrum", "Spectrum Cycle", "rainbow", "Rainbow Wave"],
+    "wave": ["wave", "Rainbow Wave", "rainbow"],
+    "breathing": ["breathing", "breathe", "pulse"],
+    "static": ["static", "direct"],
+    "off": ["off"],
+    "on": ["static", "on"],
+}
 
 
 def _run(cmd: list[str], timeout: float = 5.0, input_text: str | None = None) -> str:
@@ -83,7 +112,11 @@ def _run(cmd: list[str], timeout: float = 5.0, input_text: str | None = None) ->
         return ""
 
 
-def _run_shell(command: str, timeout: float = 8.0) -> tuple[bool, str]:
+def _run_shell(
+    command: str,
+    timeout: float = 8.0,
+    input_text: str | None = None,
+) -> tuple[bool, str]:
     try:
         out = subprocess.run(
             command,
@@ -92,6 +125,8 @@ def _run_shell(command: str, timeout: float = 8.0) -> tuple[bool, str]:
             text=True,
             timeout=timeout,
             errors="replace",
+            input=input_text,
+            env=os.environ.copy(),
         )
         text = (out.stdout or "") + (("\n" + out.stderr) if out.stderr else "")
         return out.returncode == 0, text.strip()[:12_000]
@@ -478,6 +513,10 @@ def scan_hid() -> list[dict[str, Any]]:
                 continue
             seen.add(key)
             kind_hint = "keyboard" if "kbd" in link.name else "mouse" if "mouse" in link.name else "hid"
+            hints = ["HID input — plug-and-play; no explicit connect needed."]
+            mouseish = any(w in low for w in ("mouse", "deathadder"))
+            if kind_hint == "keyboard" and not mouseish:
+                hints = _lighting_control_hints() or hints
             found.append(
                 _make(
                     kind="hid",
@@ -485,8 +524,9 @@ def scan_hid() -> list[dict[str, Any]]:
                     address=str(link),
                     connected=True,
                     icon=kind_hint,
-                    hints=["HID input — plug-and-play; no explicit connect needed."],
-                    identifiers={"dev": str(link)},
+                    hints=hints,
+                    identifiers={"dev": str(link), "hid_role": kind_hint},
+                    extra={"hid_role": kind_hint},
                 )
             )
         if found:
@@ -510,6 +550,359 @@ def scan_hid() -> list[dict[str, Any]]:
                 )
             )
     return found[:24]
+
+
+def _lighting_control_hints() -> list[str]:
+    hints: list[str] = []
+    if shutil.which("openrgb"):
+        hints.append(
+            "RGB: peripherals action=control command=lighting value=rainbow "
+            "(OpenRGB: openrgb --device <n> --mode rainbow)"
+        )
+    if shutil.which("polychromatic-cli"):
+        hints.append("RGB: polychromatic-cli -d keyboard -o spectrum")
+    if shutil.which("razer-cli"):
+        hints.append("RGB: razer-cli effect spectrum")
+    if shutil.which("brightnessctl"):
+        hints.append("Backlight: brightnessctl --device='*:kbd_backlight' set 50%")
+    if not hints:
+        hints.append(
+            "Lighting: install OpenRGB or polychromatic, then peripherals "
+            "action=control command=lighting value=rainbow."
+        )
+    return hints
+
+
+def _kbd_led_dirs() -> list[Path]:
+    root = Path("/sys/class/leds")
+    if not root.is_dir():
+        return []
+    out: list[Path] = []
+    for d in sorted(root.iterdir()):
+        low = d.name.lower()
+        if "kbd" in low and "backlight" in low:
+            out.append(d)
+        elif "keyboard" in low and any(x in low for x in ("backlight", "rgb", "led")):
+            out.append(d)
+    return out
+
+
+def scan_lighting() -> list[dict[str, Any]]:
+    """RGB controllers and keyboard backlights as first-class peripherals."""
+    found: list[dict[str, Any]] = []
+
+    for d in _kbd_led_dirs():
+        brightness = _read(d / "brightness")
+        max_b = _read(d / "max_brightness")
+        level = ""
+        try:
+            if brightness and max_b and int(max_b) > 0:
+                level = f"{round(100 * int(brightness) / int(max_b))}%"
+        except ValueError:
+            level = brightness
+        hints = [
+            f"Backlight: peripherals action=control command=brightness value=50% (now {level or '?'})",
+            f"brightnessctl --device='{d.name}' set 50%",
+        ]
+        found.append(
+            _make(
+                kind="lighting",
+                name=d.name.replace("::", " ").replace(":", " ").replace("_", " "),
+                address=d.name,
+                connected=True,
+                icon="keyboard",
+                hints=hints,
+                identifiers={"sysfs_led": str(d), "brightnessctl": d.name},
+                extra={"brightness": brightness, "max_brightness": max_b, "kind": "backlight"},
+            )
+        )
+
+    if shutil.which("openrgb"):
+        raw = _run(["openrgb", "--list-devices"], timeout=8) or _run(["openrgb", "-l"], timeout=8)
+        parsed = 0
+        for line in (raw or "").splitlines():
+            m = re.match(r"^(\d+):\s+(.+)$", line.strip())
+            if not m:
+                continue
+            idx, name = m.group(1), m.group(2).strip()
+            found.append(
+                _make(
+                    kind="lighting",
+                    name=name,
+                    address=f"openrgb:{idx}",
+                    connected=True,
+                    icon="rgb",
+                    hints=[
+                        f"RGB: peripherals action=control command=lighting value=rainbow",
+                        f"openrgb --device {idx} --mode rainbow",
+                    ],
+                    identifiers={"openrgb_id": idx},
+                    extra={"provider": "openrgb", "index": idx},
+                )
+            )
+            parsed += 1
+        if parsed == 0:
+            found.append(
+                _make(
+                    kind="lighting",
+                    name="OpenRGB controller",
+                    address="openrgb",
+                    connected=bool(raw),
+                    icon="rgb",
+                    hints=[
+                        "RGB: peripherals action=control command=lighting value=rainbow",
+                        "openrgb --list-devices ; openrgb --device 0 --mode rainbow",
+                    ],
+                    identifiers={"openrgb_id": "0"},
+                    extra={"provider": "openrgb", "list": (raw or "")[:800]},
+                )
+            )
+
+    if shutil.which("polychromatic-cli") and not any(
+        (p.get("extra") or {}).get("provider") == "polychromatic" for p in found
+    ):
+        found.append(
+            _make(
+                kind="lighting",
+                name="OpenRazer keyboard",
+                address="polychromatic",
+                connected=True,
+                icon="keyboard",
+                hints=[
+                    "RGB: peripherals action=control command=lighting value=rainbow",
+                    "polychromatic-cli -d keyboard -o spectrum",
+                ],
+                identifiers={"polychromatic": "keyboard"},
+                extra={"provider": "polychromatic"},
+            )
+        )
+
+    if shutil.which("razer-cli") and not any(
+        (p.get("extra") or {}).get("provider") in {"polychromatic", "razer"} for p in found
+    ):
+        found.append(
+            _make(
+                kind="lighting",
+                name="Razer lighting",
+                address="razer-cli",
+                connected=True,
+                icon="keyboard",
+                hints=[
+                    "RGB: peripherals action=control command=lighting value=rainbow",
+                    "razer-cli effect spectrum",
+                ],
+                identifiers={"razer_cli": "1"},
+                extra={"provider": "razer"},
+            )
+        )
+
+    found.extend(scan_openrazer())
+    found.extend(scan_asus_nkey())
+
+    if not found and _lighting_control_hints():
+        found.append(
+            _make(
+                kind="lighting",
+                name="Keyboard / RGB lighting",
+                address="lighting",
+                connected=True,
+                icon="keyboard",
+                hints=_lighting_control_hints(),
+                identifiers={},
+                extra={"provider": "generic"},
+            )
+        )
+    return found[:16]
+
+
+_RAZER_DRIVERS = ("razekbd", "razermouse", "razerkraken", "razeraccessory")
+
+_OPENRAZER_EFFECTS = {
+    "rainbow": (
+        "matrix_effect_spectrum",
+        "logo_matrix_effect_spectrum",
+        "scroll_matrix_effect_spectrum",
+        "left_matrix_effect_spectrum",
+        "right_matrix_effect_spectrum",
+        "matrix_effect_wave",
+        "logo_matrix_effect_breath",
+        "matrix_effect_breath",
+    ),
+    "spectrum": (
+        "matrix_effect_spectrum",
+        "logo_matrix_effect_spectrum",
+        "logo_matrix_effect_breath",
+        "matrix_effect_breath",
+    ),
+    "wave": ("matrix_effect_wave", "matrix_effect_spectrum"),
+    "breathing": ("matrix_effect_breath", "logo_matrix_effect_breath"),
+    "off": (
+        "matrix_effect_none",
+        "logo_matrix_effect_none",
+        "scroll_matrix_effect_none",
+    ),
+    "on": (
+        "matrix_effect_static",
+        "logo_matrix_effect_static",
+        "matrix_effect_spectrum",
+    ),
+    "static": ("matrix_effect_static", "logo_matrix_effect_static"),
+}
+
+
+def _write_sysfs(path: Path, data: bytes | str) -> tuple[bool, str]:
+    try:
+        raw = data.encode() if isinstance(data, str) else data
+        path.write_bytes(raw)
+        return True, f"Wrote {path.name}"
+    except OSError as exc:
+        return False, f"{path.name}: {exc}"
+
+
+def scan_openrazer() -> list[dict[str, Any]]:
+    """OpenRazer kernel devices (keyboards, mice) with sysfs lighting controls."""
+    found: list[dict[str, Any]] = []
+    root = Path("/sys/bus/hid/drivers")
+    for drv in _RAZER_DRIVERS:
+        d = root / drv
+        if not d.is_dir():
+            continue
+        for node in sorted(d.iterdir()):
+            if not node.is_dir() or node.name in {"module", "bind", "unbind", "new_id"}:
+                continue
+            effects = [
+                p.name
+                for p in node.iterdir()
+                if "effect" in p.name or p.name.endswith("_led_brightness")
+            ]
+            if not effects:
+                continue
+            dtype = _read(node / "device_type") or node.name
+            serial = _read(node / "device_serial")
+            role = (
+                "keyboard"
+                if "kbd" in drv or "keyboard" in dtype.lower()
+                else "mouse"
+                if "mouse" in drv or "mouse" in dtype.lower()
+                else "razer"
+            )
+            caps = ", ".join(effects[:8])
+            found.append(
+                _make(
+                    kind="lighting",
+                    name=dtype,
+                    address=serial or node.name,
+                    connected=True,
+                    icon=role,
+                    vendor="Razer",
+                    hints=[
+                        f"OpenRazer {role}: peripherals action=control command=lighting "
+                        f"value=rainbow|breathing|off ({caps})",
+                    ],
+                    identifiers={
+                        "openrazer_sysfs": str(node),
+                        "razer_role": role,
+                        "serial": serial,
+                    },
+                    extra={"provider": "openrazer", "driver": drv, "effects": effects},
+                )
+            )
+    return found[:12]
+
+
+def scan_asus_nkey() -> list[dict[str, Any]]:
+    """ASUS ROG N-KEY / Aura RGB keyboard (USB 0b05:19b6 and cousins)."""
+    node = _asus_aura_hidraw()
+    if not node:
+        return []
+    return [
+        _make(
+            kind="lighting",
+            name="ASUS ROG Aura keyboard",
+            address=str(node),
+            vendor="ASUS",
+            connected=True,
+            icon="keyboard",
+            hints=[
+                "RGB: peripherals action=control command=lighting value=rainbow "
+                "(Aura HID color cycle on the N-KEY device)",
+            ],
+            identifiers={"aura_hidraw": str(node)},
+            extra={"provider": "asus-aura", "kind": "rgb"},
+        )
+    ]
+
+
+def _apply_openrazer_sysfs(p: dict[str, Any], effect: str) -> tuple[bool, str]:
+    ident = p.get("identifiers") or {}
+    node_s = ident.get("openrazer_sysfs")
+    if not node_s:
+        return False, ""
+    node = Path(str(node_s))
+    if not node.is_dir():
+        return False, f"OpenRazer path missing: {node}"
+    files = _OPENRAZER_EFFECTS.get(effect) or _OPENRAZER_EFFECTS.get("on") or ()
+    last = "No matching OpenRazer effect file."
+    for fname in files:
+        path = node / fname
+        if not path.exists():
+            continue
+        payload: bytes | str = "1"
+        if "static" in fname:
+            payload = bytes([255, 255, 255])
+        elif "wave" in fname:
+            payload = "1"
+        ok, out = _write_sysfs(path, payload)
+        last = out
+        if not ok:
+            continue
+        bright = node / "logo_led_brightness"
+        if effect != "off" and bright.exists():
+            _write_sysfs(bright, "255")
+        elif effect == "off":
+            if bright.exists():
+                _write_sysfs(bright, "0")
+            kbd = node / "matrix_brightness"
+            if kbd.exists():
+                _write_sysfs(kbd, "0")
+        note = ""
+        if effect in {"rainbow", "spectrum"} and "spectrum" not in fname:
+            note = (
+                " This Razer device has no rainbow/spectrum mode; "
+                f"I set {fname} instead."
+            )
+        role = ident.get("razer_role") or "device"
+        return True, f"OpenRazer {role} ({p.get('name')}): {fname}.{note}"
+    return False, last
+
+
+def resolve_lighting(target: str, items: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    pool = items if items is not None else scan_lighting()
+    helper = PeripheralLearner.__new__(PeripheralLearner)
+    helper._items = pool
+    helper.memory = type("M", (), {"list_peripherals": lambda self: pool})()
+    return helper.resolve(target)
+
+
+def control_lighting_direct(target: str, command: str, value: str = "") -> tuple[bool, str, dict[str, Any] | None]:
+    """Act on live lighting devices without a full peripheral rescan."""
+    items = scan_lighting()
+    p = resolve_lighting(target, items)
+    if p is None and items:
+        p = items[0]
+    if p is None:
+        return False, f"No lighting device matching '{target}'.", None
+    ok, out = control_peripheral(p, command, value)
+    # Same physical ROG keyboard: also hit Aura if we only resolved the WMI backlight.
+    if not (p.get("identifiers") or {}).get("aura_hidraw"):
+        aura = next((i for i in items if (i.get("identifiers") or {}).get("aura_hidraw")), None)
+        if aura is not None:
+            a_ok, a_out = control_peripheral(aura, command, value)
+            out = f"{out}\n{a_out}"
+            ok = ok or a_ok
+            if a_ok:
+                p = aura
+    return ok, out, p
 
 
 def scan_cameras() -> list[dict[str, Any]]:
@@ -824,6 +1217,7 @@ def scan_all(*, discover: bool = False) -> list[dict[str, Any]]:
         scan_audio,
         scan_displays,
         scan_hid,
+        scan_lighting,
         scan_cameras,
         scan_printers,
         scan_storage,
@@ -863,6 +1257,536 @@ _VOLUME_RE = re.compile(r"^\d{1,3}%?$")
 
 def _bt_mac(p: dict[str, Any]) -> str:
     return (p.get("identifiers") or {}).get("mac") or p.get("address") or ""
+
+
+def _normalize_effect(command: str, value: str) -> str:
+    raw = (value or command or "").strip().lower()
+    if command in {"lighting", "light", "lights", "rgb", "led", "backlight"}:
+        raw = (value or "on").strip().lower()
+    aliases = {
+        "rainbow": "rainbow",
+        "spectrum": "spectrum",
+        "cycle": "spectrum",
+        "wave": "wave",
+        "breathing": "breathing",
+        "breathe": "breathing",
+        "pulse": "breathing",
+        "static": "static",
+        "solid": "static",
+        "off": "off",
+        "black": "off",
+        "0": "off",
+        "on": "on",
+        "white": "on",
+    }
+    return aliases.get(raw, raw)
+
+
+def _asus_aura_hidraw() -> Path | None:
+    root = Path("/sys/class/hidraw")
+    if not root.is_dir():
+        return None
+    for d in sorted(root.iterdir()):
+        uevent = _read(d / "device" / "uevent")
+        if "00000B05" not in uevent.upper() and "0B05" not in uevent:
+            continue
+        if not any(pid in uevent.upper() for pid in ("19B6", "1854", "1869", "1866", "1A30", "18C6")):
+            continue
+        desc = d / "device" / "report_descriptor"
+        try:
+            raw = desc.read_bytes()
+        except OSError:
+            raw = b""
+        if raw and b"\x85\x5d" not in raw:
+            continue
+        node = Path("/dev") / d.name
+        if node.exists():
+            return node
+    return None
+
+
+def _aura_pad(data: bytes, length: int = 64) -> bytes:
+    if len(data) >= length:
+        return data[:length]
+    return data + bytes(length - len(data))
+
+
+def _aura_mode_packet(mode: int, r: int = 255, g: int = 0, b: int = 0, speed: int = 0xEB) -> bytes:
+    msg = bytearray(64)
+    msg[0], msg[1], msg[3] = 0x5D, 0xB3, mode
+    msg[4], msg[5], msg[6], msg[7] = r, g, b, speed
+    return bytes(msg)
+
+
+def _aura_messages(effect: str) -> list[bytes]:
+    """64-byte Aura Core packets (OpenRGB / asusctl / hid-asus report 0x5A+0x5D)."""
+    level = 0 if effect == "off" else 3
+    if effect == "rainbow":
+        body = _aura_mode_packet(3, 0xFF, 0, 0)  # rainbow wave
+    elif effect in {"spectrum", "cycle"}:
+        body = _aura_mode_packet(2, 0xFF, 0, 0)  # color cycle
+    elif effect == "wave":
+        body = _aura_mode_packet(3, 0xFF, 0, 0)
+    elif effect in {"breathing"}:
+        pkt = bytearray(_aura_mode_packet(1, 0xFF, 0xFF, 0xFF))
+        pkt[9], pkt[10], pkt[11], pkt[12] = 1, 0x40, 0x40, 0x40
+        body = bytes(pkt)
+    elif effect == "off":
+        body = _aura_mode_packet(0, 0, 0, 0)
+    else:
+        body = _aura_mode_packet(0, 0xFF, 0xFF, 0xFF)
+    ident_5d = _aura_pad(b"]ASUS Tech.Inc.")
+    ident_5a = _aura_pad(bytes([0x5A]) + b"ASUS Tech.Inc.\x00")
+    return [
+        _aura_pad(bytes([0x5D, 0xB9])),
+        ident_5d,
+        ident_5a,
+        _aura_pad(bytes([0x5D, 0x05, 0x20, 0x31, 0x00, 0x10])),
+        _aura_pad(bytes([0x5D, 0xBD, 0x01, 0xFF, 0x1F, 0xFF, 0xFF, 0xFF])),
+        _aura_pad(bytes([0x5D, 0xBA, 0xC5, 0xC4, level])),
+        _aura_pad(bytes([0x5A, 0xBA, 0xC5, 0xC4, level])),
+        body,
+        _aura_pad(bytes([0x5D, 0xB5])),
+        _aura_pad(bytes([0x5D, 0xB4])),
+    ]
+
+
+def _usb_devnode_for_hidraw(hidraw: Path) -> Path | None:
+    sysfs = Path("/sys/class/hidraw") / hidraw.name / "device"
+    try:
+        cur = sysfs.resolve()
+    except OSError:
+        return None
+    for parent in [cur, *cur.parents]:
+        bus_f, dev_f = parent / "busnum", parent / "devnum"
+        if not (bus_f.is_file() and dev_f.is_file()):
+            continue
+        try:
+            bus = int(bus_f.read_text().strip())
+            dev = int(dev_f.read_text().strip())
+        except ValueError:
+            continue
+        node = Path(f"/dev/bus/usb/{bus:03d}/{dev:03d}")
+        if node.exists():
+            return node
+    return None
+
+
+def _hid_sfeature_ioctl(length: int) -> int:
+    return (3 << 30) | (length << 16) | (ord("H") << 8) | 0x06
+
+
+def _hidraw_send_feature(path: Path, packets: list[bytes]) -> tuple[bool, str]:
+    """HIDIOCSFEATURE only. A hidraw write() can succeed without changing Aura LEDs."""
+    import array
+    import fcntl
+
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as exc:
+        return False, str(exc)
+    sent = 0
+    last = "no packets"
+    try:
+        for pkt in packets:
+            err: OSError | None = None
+            for length in (64, 17):
+                raw = _aura_pad(pkt, length)
+                buf = array.array("B", raw)
+                try:
+                    fcntl.ioctl(fd, _hid_sfeature_ioctl(length), buf)
+                    err = None
+                    break
+                except OSError as exc:
+                    err = exc
+            if err is not None:
+                return False, f"{path.name}: {err} after {sent} reports"
+            sent += 1
+            last = f"{path.name} HIDIOCSFEATURE x{sent}"
+        return True, last
+    finally:
+        os.close(fd)
+
+
+_AURA_USB_SENDER = r"""
+import array, ctypes, fcntl, os, sys
+
+def pad(data, n):
+    return (data + bytes(n))[:n] if len(data) >= n else data + bytes(n - len(data))
+
+def hid_sfeature(n):
+    return (3 << 30) | (n << 16) | (ord("H") << 8) | 6
+
+def send_hidraw(path, packets):
+    fd = os.open(path, os.O_RDWR)
+    try:
+        for pkt in packets:
+            ok = False
+            last = None
+            for length in (64, 17):
+                buf = array.array("B", pad(pkt, length))
+                try:
+                    fcntl.ioctl(fd, hid_sfeature(length), buf)
+                    ok = True
+                    break
+                except OSError as exc:
+                    last = exc
+            if not ok:
+                raise last
+        return "hidraw-feature"
+    finally:
+        os.close(fd)
+
+class Ctrl(ctypes.Structure):
+    _fields_ = [
+        ("bRequestType", ctypes.c_uint8),
+        ("bRequest", ctypes.c_uint8),
+        ("wValue", ctypes.c_uint16),
+        ("wIndex", ctypes.c_uint16),
+        ("wLength", ctypes.c_uint16),
+        ("timeout", ctypes.c_uint32),
+        ("data", ctypes.c_void_p),
+    ]
+
+class UsbIoctl(ctypes.Structure):
+    _fields_ = [
+        ("ifno", ctypes.c_int),
+        ("ioctl_code", ctypes.c_int),
+        ("data", ctypes.c_void_p),
+    ]
+
+USBDEVFS_CONTROL = (3 << 30) | (ctypes.sizeof(Ctrl) << 16) | (ord("U") << 8) | 0
+USBDEVFS_IOCTL = (3 << 30) | (ctypes.sizeof(UsbIoctl) << 16) | (ord("U") << 8) | 18
+USBDEVFS_CLAIMINTERFACE = (2 << 30) | (4 << 16) | (ord("U") << 8) | 15
+USBDEVFS_RELEASEINTERFACE = (2 << 30) | (4 << 16) | (ord("U") << 8) | 16
+USBDEVFS_DISCONNECT = (ord("U") << 8) | 22
+USBDEVFS_CONNECT = (ord("U") << 8) | 23
+
+def send_usb(path, packets):
+    ufd = os.open(path, os.O_RDWR)
+    iface = ctypes.c_uint(0)
+    try:
+        try:
+            fcntl.ioctl(ufd, USBDEVFS_IOCTL, UsbIoctl(0, USBDEVFS_DISCONNECT, None))
+        except OSError:
+            pass
+        fcntl.ioctl(ufd, USBDEVFS_CLAIMINTERFACE, iface)
+        for pkt in packets:
+            raw = pad(pkt, 17)
+            buf = ctypes.create_string_buffer(raw, 17)
+            wvalues = (0x0300 | raw[0], 0x035D)
+            last = None
+            ok = False
+            for wvalue in wvalues:
+                ctrl = Ctrl(0x21, 9, wvalue, 0, 17, 2000, ctypes.addressof(buf))
+                try:
+                    fcntl.ioctl(ufd, USBDEVFS_CONTROL, ctrl)
+                    ok = True
+                    break
+                except OSError as exc:
+                    last = exc
+            if not ok:
+                raise last
+        return "usb-set-report"
+    finally:
+        try:
+            fcntl.ioctl(ufd, USBDEVFS_RELEASEINTERFACE, iface)
+        except OSError:
+            pass
+        try:
+            fcntl.ioctl(ufd, USBDEVFS_IOCTL, UsbIoctl(0, USBDEVFS_CONNECT, None))
+        except OSError:
+            pass
+        os.close(ufd)
+
+hid, usb, blob = sys.argv[1], sys.argv[2], sys.argv[3]
+packets = [bytes.fromhex(x) for x in blob.split(",") if x]
+how, errs = [], []
+# USB SET_REPORT with kernel-driver detach is what actually drives Aura on 0b05:19b6.
+for name, fn, target in (
+    ("usb", send_usb, usb),
+    ("hidraw", send_hidraw, hid),
+):
+    if not target or target == "-":
+        continue
+    try:
+        how.append(fn(target, packets))
+    except OSError as exc:
+        errs.append(f"{name}: {exc}")
+if how:
+    print("OK", "+".join(how))
+    sys.exit(0)
+print("FAIL", "; ".join(errs) or "no transport")
+sys.exit(1)
+"""
+
+
+def _sudo_send_aura(hidraw: Path, packets: list[bytes]) -> tuple[bool, str]:
+    try:
+        password = (store.get().permissions.sudo_password or "").strip()
+    except Exception:  # noqa: BLE001
+        password = ""
+    if not password:
+        return False, (
+            f"Permission denied opening {hidraw} "
+            "(save a sudo password in Systems, or: sudo chmod a+rw "
+            f"{hidraw})"
+        )
+    usb = _usb_devnode_for_hidraw(hidraw)
+    blob = ",".join(p.hex() for p in packets)
+    cmd = (
+        "sudo -S -p '' python3 -c "
+        + shlex.quote(_AURA_USB_SENDER)
+        + " "
+        + shlex.quote(str(hidraw))
+        + " "
+        + shlex.quote(str(usb) if usb else "-")
+        + " "
+        + shlex.quote(blob)
+    )
+    ok, out = _run_shell(cmd, timeout=20, input_text=password + "\n")
+    if ok and out.startswith("OK"):
+        how = out.split(None, 1)[-1] if " " in out else "privileged"
+        return True, f"{hidraw.name} via sudo ({how})"
+    return False, out or "sudo Aura send failed"
+
+
+def _apply_asus_aura(effect: str, hidraw: Path | None = None) -> tuple[bool, str]:
+    node = hidraw or _asus_aura_hidraw()
+    if node is None:
+        return False, "No ASUS Aura N-KEY hidraw device found."
+    packets = _aura_messages(effect)
+    ok, out = _hidraw_send_feature(node, packets)
+    if ok:
+        return True, f"Aura {effect} on {out}"
+    ok, sudo_out = _sudo_send_aura(node, packets)
+    if ok:
+        return True, f"Aura {effect} on {sudo_out}"
+    return False, f"{out}; {sudo_out}"
+
+
+def _logind_sessions() -> list[str]:
+    ids: list[str] = []
+    env_sid = os.environ.get("XDG_SESSION_ID")
+    if env_sid:
+        ids.append(env_sid)
+    raw = _run(["loginctl", "list-sessions", "--no-legend"], timeout=3)
+    for line in raw.splitlines():
+        parts = line.split()
+        if parts:
+            ids.append(parts[0])
+    return list(dict.fromkeys(ids))
+
+
+def _logind_set_led(device: str, value: int) -> tuple[bool, str]:
+    last = "no logind session"
+    for sid in _logind_sessions():
+        ok, out = _run_shell(
+            "busctl call org.freedesktop.login1 "
+            f"/org/freedesktop/login1/session/{sid} "
+            "org.freedesktop.login1.Session SetBrightness ssu "
+            f"leds {shlex.quote(device)} {int(value)}"
+        )
+        last = out or f"logind session {sid}"
+        if ok:
+            return True, f"logind {device}={value} (session {sid})"
+    return False, last
+
+
+def _set_led_brightness(p: dict[str, Any], level: str) -> tuple[bool, str]:
+    ident = p.get("identifiers") or {}
+    level = (level or "50%").strip() or "50%"
+    device = ident.get("brightnessctl") or ident.get("sysfs_led") or "asus::kbd_backlight"
+    if device and "/" in str(device):
+        device = Path(str(device)).name
+    led_path = Path(str(ident.get("sysfs_led") or f"/sys/class/leds/{device}"))
+    max_b = 3
+    try:
+        max_b = int(_read(led_path / "max_brightness") or "3")
+    except ValueError:
+        max_b = 3
+    try:
+        pct = int(str(level).rstrip("%"))
+        raw = max(0, min(max_b, round(max_b * pct / 100) if pct > max_b else pct))
+        if str(level).endswith("%") or pct > max_b:
+            raw = max(0, min(max_b, round(max_b * min(pct, 100) / 100)))
+    except ValueError:
+        raw = max_b
+
+    before = _read(led_path / "brightness")
+    logs: list[str] = []
+    ok, out = _logind_set_led(device, raw)
+    logs.append(out)
+    if not ok and shutil.which("brightnessctl"):
+        ok, out = _run_shell(f"brightnessctl --device={shlex.quote(device)} set {raw}")
+        logs.append(out)
+    after = _read(led_path / "brightness")
+    if after == str(raw):
+        # Pulse if it was already at the target so the user sees a change.
+        if before == after and raw > 0:
+            _logind_set_led(device, 0)
+            time.sleep(0.12)
+            _logind_set_led(device, raw)
+        return True, f"Keyboard brightness {after}/{max_b} on {device}"
+    if ok:
+        return False, (
+            f"logind reported success but sysfs is still {after or '?'} "
+            f"(wanted {raw}). " + " ".join(logs)
+        )
+    return False, "Could not set backlight brightness. " + " ".join(logs)
+
+
+def _apply_lighting(p: dict[str, Any], command: str, value: str) -> tuple[bool, str]:
+    """Set RGB effect or keyboard backlight on a lighting/HID device."""
+    ident = p.get("identifiers") or {}
+    effect = _normalize_effect(command, value)
+    if effect.endswith("%") or (effect.isdigit() and command in {"lighting", "backlight", "brightness"}):
+        return _set_led_brightness(p, value or command)
+
+    logs: list[str] = []
+    name_hint = (p.get("name") or "") + " " + str(ident.get("openrgb_id") or "")
+
+    if ident.get("openrazer_sysfs"):
+        ok, out = _apply_openrazer_sysfs(p, effect)
+        if ok:
+            return True, out
+        if out:
+            logs.append(out)
+
+    keyboardish = (
+        bool(ident.get("aura_hidraw") or ident.get("sysfs_led") or ident.get("brightnessctl"))
+        or (p.get("extra") or {}).get("kind") in {"backlight", "rgb"}
+        or (p.get("extra") or {}).get("provider") == "asus-aura"
+        or any(w in (p.get("name") or "").lower() for w in ("keyboard", "asus", "kbd", "n-key", "aura"))
+    )
+    if keyboardish:
+        hid = Path(str(ident["aura_hidraw"])) if ident.get("aura_hidraw") else None
+        bright_ok, bright_out = _set_led_brightness(
+            p, "0%" if effect == "off" else "100%"
+        )
+        logs.append(bright_out)
+        aura_ok, aura_out = _apply_asus_aura(effect, hid)
+        logs.append(aura_out)
+        if aura_ok:
+            return True, f"{aura_out}. {bright_out}"
+        if effect in {"rainbow", "spectrum", "wave", "breathing", "static", "on"}:
+            return False, (
+                f"RGB did not change ({aura_out}). "
+                f"Brightness layer: {bright_out}. "
+                "This ROG keyboard's visible colours are Aura on the N-KEY USB device, "
+                "not the 0–3 WMI backlight. I need hidraw access — save a sudo password "
+                "in Systems, or run: sudo chmod a+rw /dev/hidraw3"
+            )
+        if bright_ok:
+            return True, bright_out
+
+    if effect in {"off", "on"} and (
+        ident.get("sysfs_led") or ident.get("brightnessctl") or (p.get("extra") or {}).get("kind") == "backlight"
+    ):
+        ok, out = _set_led_brightness(p, "0%" if effect == "off" else "100%")
+        logs.append(out)
+        if ok:
+            return ok, out
+
+    rgb_id = ident.get("openrgb_id")
+    if shutil.which("openrgb"):
+        idx = rgb_id if rgb_id is not None and str(rgb_id) != "" else "0"
+        if effect == "off":
+            ok, out = _run_shell(f"openrgb --device {idx} --mode static --color 000000", timeout=12)
+            logs.append(out)
+            if ok:
+                return True, out or f"OpenRGB device {idx} off"
+        elif effect == "on":
+            ok, out = _run_shell(f"openrgb --device {idx} --mode static --color FFFFFF", timeout=12)
+            logs.append(out)
+            if ok:
+                return True, out or f"OpenRGB device {idx} on"
+        else:
+            modes = _EFFECT_ALIASES.get(effect, [effect])
+            for mode in modes:
+                ok, out = _run_shell(f'openrgb --device {idx} --mode "{mode}"', timeout=12)
+                logs.append(out)
+                if ok:
+                    return True, out or f"OpenRGB device {idx} mode {mode}"
+
+    if shutil.which("polychromatic-cli"):
+        poly = {
+            "rainbow": "spectrum",
+            "spectrum": "spectrum",
+            "wave": "wave",
+            "breathing": "breathing",
+            "static": "static",
+            "off": "off",
+            "on": "static",
+        }.get(effect, effect)
+        device = ident.get("polychromatic") or "keyboard"
+        ok, out = _run_shell(f"polychromatic-cli -d {device} -o {poly}", timeout=12)
+        logs.append(out)
+        if ok:
+            return True, out or f"polychromatic {poly}"
+
+    if shutil.which("razer-cli"):
+        razer = {
+            "rainbow": "spectrum",
+            "spectrum": "spectrum",
+            "wave": "wave",
+            "breathing": "breathing",
+            "static": "static",
+            "off": "off",
+            "on": "static",
+        }.get(effect, effect)
+        ok, out = _run_shell(f"razer-cli effect {razer}", timeout=12)
+        logs.append(out)
+        if ok:
+            return True, out or f"razer-cli {razer}"
+
+    backlightish = bool(
+        ident.get("sysfs_led")
+        or ident.get("brightnessctl")
+        or (p.get("extra") or {}).get("kind") == "backlight"
+        or (p.get("kind") in {"hid", "lighting"} and "kbd" in (p.get("name") or "").lower())
+    )
+    if backlightish:
+        level = "0%" if effect == "off" else (
+            value if (value or "").endswith("%") else "100%"
+        )
+        ok, out = _set_led_brightness(p, level)
+        logs.append(out)
+        if ok:
+            if effect in {"rainbow", "spectrum", "wave", "breathing"}:
+                razer_note = ""
+                razer_devs = scan_openrazer()
+                mice = [d.get("name") for d in razer_devs if (d.get("identifiers") or {}).get("razer_role") == "mouse"]
+                kbds = [d.get("name") for d in razer_devs if (d.get("identifiers") or {}).get("razer_role") == "keyboard"]
+                if kbds:
+                    razer_note = f" Razer keyboard(s) also present: {', '.join(kbds)}."
+                elif mice:
+                    razer_note = (
+                        f" No Razer keyboard is attached — OpenRazer only sees "
+                        f"{', '.join(mice)}, which is a mouse (no rainbow keyboard matrix)."
+                    )
+                else:
+                    razer_note = " No RGB keyboard controller is available on this machine."
+                return True, (
+                    f"{out}\nThis LED is a brightness backlight, not RGB. I set it to full."
+                    f"{razer_note}"
+                )
+            return True, out
+
+    missing = []
+    if not shutil.which("openrgb"):
+        missing.append("openrgb")
+    if not shutil.which("polychromatic-cli"):
+        missing.append("polychromatic-cli")
+    if not shutil.which("razer-cli"):
+        missing.append("razer-cli")
+    detail = "\n".join(x for x in logs if x)[:2000]
+    hint = (
+        f"Couldn't set lighting on {p.get('name') or name_hint} to '{effect}'. "
+        + (f"Missing: {', '.join(missing)}. Install via device_control shell, then retry. " if missing else "")
+        + (f"Output:\n{detail}" if detail else "")
+    )
+    return False, hint.strip()
 
 
 def control_peripheral(
@@ -953,11 +1877,24 @@ def control_peripheral(
                 return _run_shell(f"wpctl set-default {wp_id}")
         return False, "No audio control utility (pactl/wpctl) for this device."
 
-    if command in {"brightness"} and kind in {"display", "usb"}:
+    if command in {"brightness"} and kind in {"display", "usb", "hid", "lighting"}:
+        ident = p.get("identifiers") or {}
+        name_l = (p.get("name") or "").lower()
+        is_keyboard = (
+            kind in {"hid", "lighting"}
+            or bool(ident.get("sysfs_led") or ident.get("brightnessctl") or ident.get("openrgb_id"))
+            or ident.get("hid_role") == "keyboard"
+            or any(w in name_l for w in ("keyboard", "kbd", "backlight"))
+        )
+        if is_keyboard:
+            return _set_led_brightness(p, value.strip() or "50%")
         level = value.strip() or "50%"
         if shutil.which("brightnessctl"):
             return _run_shell(f"brightnessctl set {level}")
         return False, "brightnessctl not available."
+
+    if command in _LIGHTING_COMMANDS and kind != "display":
+        return _apply_lighting(p, command, value)
 
     if command in {"enable", "disable", "on", "off"} and kind == "display":
         conn = ident.get("connector") or addr
@@ -1052,6 +1989,13 @@ def inspect_peripheral(p: dict[str, Any]) -> dict[str, Any]:
     if kind == "wifi":
         extra["nmcli"] = _run(["nmcli", "-f", "SSID,SIGNAL,SECURITY,BARS", "dev", "wifi"], timeout=6)[:1500]
 
+    if kind in {"hid", "lighting"}:
+        extra["lighting"] = "\n".join(_lighting_control_hints())[:1500]
+        if ident.get("sysfs_led"):
+            extra["led"] = _read(Path(ident["sysfs_led"]) / "uevent")[:800]
+        if shutil.which("openrgb"):
+            extra["openrgb"] = _run(["openrgb", "--list-devices"], timeout=8)[:1500]
+
     name = p.get("name")
     facts.insert(
         0,
@@ -1074,7 +2018,9 @@ def format_inventory(peripherals: list[dict[str, Any]], *, limit: int = 48) -> s
     lines = [
         f"=== Peripherals ({available} present, {connected} connected) ===",
         "Use the peripherals tool to scan, inspect, connect, or control these. "
-        "Match by id or name — do not guess shell flags when a control hint exists.",
+        "Match by id or name — do not guess shell flags when a control hint exists. "
+        "Keyboard RGB/backlight: peripherals action=control command=lighting "
+        "value=rainbow|spectrum|off|50%.",
     ]
     by_kind: dict[str, list[dict[str, Any]]] = {}
     for p in peripherals:
@@ -1175,18 +2121,54 @@ class PeripheralLearner:
         for p in pool:
             if (p.get("address") or "").lower() == needle:
                 return p
+
+        tokens = [needle]
+        if needle in {"keyboard", "kbd", "keyboards"}:
+            tokens.extend(("keyboard", "kbd", "backlight", "keypad"))
+        if needle in {"backlight", "backlights", "lights", "lighting", "rgb", "led"}:
+            tokens.extend(("backlight", "lighting", "rgb", "kbd"))
+        if needle in {"razer"} or needle.startswith("razer"):
+            tokens.extend(("razer", "openrazer"))
+        # unique, keep order
+        seen_t: set[str] = set()
+        tokens = [t for t in tokens if not (t in seen_t or seen_t.add(t))]
+
         matches = [
             p
             for p in pool
-            if needle in (p.get("name") or "").lower() or needle in (p.get("id") or "").lower()
+            if any(
+                t in (p.get("name") or "").lower()
+                or t in (p.get("id") or "").lower()
+                or t in (p.get("vendor") or "").lower()
+                or t in ((p.get("extra") or {}).get("driver") or "").lower()
+                for t in tokens
+            )
         ]
-        if len(matches) == 1:
-            return matches[0]
-        if matches:
-            # Prefer connected, then available.
-            matches.sort(key=lambda x: (not x.get("connected"), not x.get("available", True)))
-            return matches[0]
-        return None
+        if not matches:
+            return None
+        lighting_ask = any(
+            w in needle for w in ("keyboard", "kbd", "backlight", "rgb", "light", "razer")
+        )
+        want_keyboard = any(w in needle for w in ("keyboard", "kbd", "backlight"))
+        want_razer = "razer" in needle
+
+        def _rank(x: dict[str, Any]) -> tuple:
+            name_l = (x.get("name") or "").lower()
+            ident = x.get("identifiers") or {}
+            role = ident.get("razer_role") or ""
+            mouseish = any(w in name_l for w in ("mouse", "deathadder", "g502")) or role == "mouse"
+            return (
+                0 if lighting_ask and x.get("kind") == "lighting" else 1,
+                0 if want_razer and ident.get("openrazer_sysfs") else 1,
+                0 if want_keyboard and "backlight" in name_l else 1,
+                0 if want_keyboard and role == "keyboard" else 1,
+                1 if want_keyboard and mouseish else 0,
+                not x.get("connected"),
+                not x.get("available", True),
+            )
+
+        matches.sort(key=_rank)
+        return matches[0]
 
     async def scan(self, *, llm: Any | None = None, reason: str = "manual", discover: bool = False) -> list[dict[str, Any]]:
         async with self._lock:

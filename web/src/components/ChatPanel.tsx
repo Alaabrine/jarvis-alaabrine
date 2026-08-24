@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { mediaUrl } from "../api";
+import { useMicHold } from "../useMicHold";
 import type { AgentState, ChatMessage, MediaAttachment, OutgoingAttachment } from "../types";
 import { MessageContent } from "./MessageContent";
+import { WelcomeBriefing, type BriefingStatus } from "./WelcomeBriefing";
 
 const MAX_ATTACHMENTS = 6;
 const MAX_BYTES = 40 * 1024 * 1024;
@@ -36,6 +38,9 @@ interface Props {
   ) => void;
   onInterrupt: () => void;
   voice: VoiceApi;
+  briefing?: BriefingStatus | null;
+  onOpenSystems?: () => void;
+  onOpenDevices?: () => void;
 }
 
 async function fileToOutgoing(file: File): Promise<OutgoingAttachment> {
@@ -53,12 +58,22 @@ async function fileToOutgoing(file: File): Promise<OutgoingAttachment> {
   };
 }
 
-export function ChatPanel({ messages, agentState, onSend, onInterrupt, voice }: Props) {
+export function ChatPanel({
+  messages,
+  agentState,
+  onSend,
+  onInterrupt,
+  voice,
+  briefing = null,
+  onOpenSystems,
+  onOpenDevices,
+}: Props) {
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState<PendingFile[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const { beginMicHold } = useMicHold(voice);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -144,18 +159,18 @@ export function ChatPanel({ messages, agentState, onSend, onInterrupt, voice }: 
     <section className="chat-panel">
       <div className="messages" ref={scrollRef}>
         {messages.length === 0 && (
-          <div className="welcome">
-            <p className="welcome-title">Good day. JARVIS at your service.</p>
-            <p className="welcome-sub">
-              Ask me anything, or attach images and videos for analysis. I can also manage
-              your files, run commands, launch apps, and search the web — with your approval
-              where it matters.
-            </p>
-          </div>
+          <WelcomeBriefing
+            status={briefing}
+            onSuggest={(prompt) => onSend(prompt, [])}
+            onOpenSystems={() => onOpenSystems?.()}
+            onOpenDevices={() => onOpenDevices?.()}
+          />
         )}
         {messages.map((m, i) => (
-          <div key={i} className={`bubble bubble-${m.role}`}>
-            <div className="bubble-role">{m.role === "user" ? "You" : "JARVIS"}</div>
+          <div key={i} className={`bubble bubble-${m.role}${m.working ? " bubble-working" : ""}`}>
+            <div className="bubble-role">
+              {m.role === "user" ? "You" : m.working ? "JARVIS · working" : "JARVIS"}
+            </div>
             {m.attachments && m.attachments.length > 0 && (
               <div className="bubble-media">
                 {m.attachments.map((a, ai) => (
@@ -164,6 +179,20 @@ export function ChatPanel({ messages, agentState, onSend, onInterrupt, voice }: 
               </div>
             )}
             {m.content && <MessageContent role={m.role} content={m.content} />}
+            {m.role === "assistant" && !m.working && m.suggestions && m.suggestions.length > 0 && (
+              <div className="bubble-suggest">
+                {m.suggestions.map((s, si) => (
+                  <button
+                    key={`${s.label}-${si}`}
+                    type="button"
+                    className="briefing-chip"
+                    onClick={() => onSend(s.prompt, [])}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         ))}
         {busy && agentState !== "awaiting_confirmation" && (
@@ -197,96 +226,104 @@ export function ChatPanel({ messages, agentState, onSend, onInterrupt, voice }: 
         </div>
       )}
 
-      <div className={`composer ${voice.listening || voice.pttActive ? "listening" : ""}`}>
-        <input
-          ref={fileRef}
-          type="file"
-          accept={ACCEPT}
-          multiple
-          hidden
-          onChange={(e) => onPickFiles(e.target.files)}
-        />
-        <button
-          type="button"
-          className="attach-btn"
-          title="Attach image or video"
-          disabled={busy}
-          onClick={() => fileRef.current?.click()}
-        >
-          ＋
-        </button>
-        <textarea
-          value={draft}
-          placeholder={
-            voice.pttActive
-              ? "Push-to-talk — release to send…"
-              : voice.listening
-                ? "Listening…"
-                : pending.length
-                  ? "Add a caption or question about the media…"
-                  : "Hold mic or Super+` to speak…"
-          }
-          onChange={(e) => setDraft(e.target.value)}
-          onPaste={(e) => {
-            const files = e.clipboardData?.files;
-            if (files?.length) {
-              e.preventDefault();
-              onPickFiles(files);
-            }
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Escape" && busy) {
-              e.preventDefault();
-              onInterrupt();
-              return;
-            }
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void submit();
-            }
-          }}
-          rows={1}
-        />
-        <button
-          type="button"
-          className={`mic-btn ${voice.pttActive || voice.listening ? "mic-on" : ""}`}
-          title={
-            voice.supported
-              ? "Hold to talk — release to send"
-              : "Microphone recording unavailable"
-          }
-          disabled={!voice.supported}
-          aria-label="Hold to talk"
-          onPointerDown={(e) => {
-            if (!voice.supported || e.button !== 0) return;
-            e.preventDefault();
-            (e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId);
-            voice.startPushToTalk();
-          }}
-          onPointerUp={(e) => {
-            if (!voice.supported) return;
-            try {
-              (e.currentTarget as HTMLButtonElement).releasePointerCapture(e.pointerId);
-            } catch {
-              /* ignore */
-            }
-            voice.stopPushToTalk();
-          }}
-          onPointerCancel={() => voice.stopPushToTalk()}
-          onLostPointerCapture={() => voice.stopPushToTalk()}
-          onContextMenu={(e) => e.preventDefault()}
-        >
-          <MicIcon active={voice.pttActive || voice.listening} />
-        </button>
-        {busy ? (
-          <button className="stop-btn" onClick={onInterrupt} title="Interrupt (Esc)">
-            Stop
+      <div className={`composer-dock ${voice.listening || voice.pttActive ? "listening" : ""}`}>
+        <div className="composer">
+          <input
+            ref={fileRef}
+            type="file"
+            accept={ACCEPT}
+            multiple
+            hidden
+            onChange={(e) => onPickFiles(e.target.files)}
+          />
+          <button
+            type="button"
+            className="attach-btn"
+            title="Attach image or video"
+            onClick={() => fileRef.current?.click()}
+          >
+            ＋
           </button>
-        ) : (
-          <button className="send-btn" onClick={() => void submit()} disabled={!canSend}>
+          <textarea
+            value={draft}
+            placeholder={
+              busy
+                ? "I'm still working — elaborate, follow up, or say stop…"
+                : voice.pttActive
+                  ? "Listening — release to send"
+                  : voice.listening
+                    ? "Listening…"
+                    : pending.length
+                      ? "Add a caption, or just send the media…"
+                      : "Speak to me, or type…"
+            }
+            onChange={(e) => setDraft(e.target.value)}
+            onPaste={(e) => {
+              const files = e.clipboardData?.files;
+              if (files?.length) {
+                e.preventDefault();
+                onPickFiles(files);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && busy) {
+                e.preventDefault();
+                onInterrupt();
+                return;
+              }
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void submit();
+              }
+            }}
+            rows={1}
+          />
+          <button
+            type="button"
+            className={`mic-btn ${voice.pttActive || voice.listening ? "mic-on" : ""}`}
+            title={
+              voice.supported
+                ? "Hold to talk — release to send (or Super+` anywhere)"
+                : "Microphone recording unavailable"
+            }
+            disabled={!voice.supported}
+            aria-label="Hold to talk"
+            aria-pressed={voice.pttActive || voice.listening}
+            onMouseDown={(e) => {
+              if (e.button !== 0) return;
+              e.preventDefault();
+              beginMicHold();
+            }}
+            onTouchStart={(e) => {
+              e.preventDefault();
+              beginMicHold();
+            }}
+            onClick={(e) => e.preventDefault()}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <MicIcon active={voice.pttActive || voice.listening} />
+          </button>
+          {busy && (
+            <button className="stop-btn" onClick={onInterrupt} title="Cancel this task (Esc)">
+              Stop
+            </button>
+          )}
+          <button
+            className="send-btn"
+            onClick={() => void submit()}
+            disabled={!canSend}
+            title={busy ? "Send a follow-up while JARVIS works" : "Send"}
+          >
             Send
           </button>
-        )}
+        </div>
+        <p className="composer-hint">
+          {voice.pttActive || voice.listening
+            ? "Listening — release to send"
+            : busy
+              ? "Esc or Stop to cancel · speak to barge in"
+              : "Hold the orb to speak · Super+` from anywhere"}
+        </p>
       </div>
     </section>
   );

@@ -3,9 +3,10 @@ import type { ActivityItem, AgentState } from "../types";
 
 const STATE_TEXT: Record<string, string> = {
   thinking: "Reasoning about the request",
-  running_tool: "Executing an approved action",
+  running_tool: "Executing",
   awaiting_confirmation: "Awaiting authorisation",
   interrupted: "Interrupted by user",
+  steered: "Incorporating your follow-up",
 };
 
 export function ActivityFeed({
@@ -36,7 +37,7 @@ export function ActivityFeed({
   return (
     <section className="activity">
       <div className="activity-header">
-        <span className="activity-title">Activity Monitor</span>
+        <span className="activity-title">Telemetry</span>
         <div className="activity-header-actions">
           {onClear && items.length > 0 && (
             <button
@@ -53,7 +54,9 @@ export function ActivityFeed({
       </div>
       <div className="activity-body" ref={ref} onScroll={onScroll}>
         {items.length === 0 && (
-          <p className="activity-empty">Live telemetry of JARVIS's actions appears here.</p>
+          <p className="activity-empty">
+            I will show you what I am doing here — thoughts, tools, and results — as I work.
+          </p>
         )}
         {items.map((item) => (
           <ActivityRow key={item.id} item={item} />
@@ -70,7 +73,11 @@ function ActivityRow({ item }: { item: ActivityItem }) {
     return (
       <div className="act-row act-status">
         <span className="act-dot" />
-        <span>{STATE_TEXT[item.state ?? ""] ?? item.state}</span>
+        <span>
+          {item.state === "steered" && item.text
+            ? `Follow-up: ${item.text}`
+            : (STATE_TEXT[item.state ?? ""] ?? item.state)}
+        </span>
       </div>
     );
   }

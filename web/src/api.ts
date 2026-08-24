@@ -5,8 +5,15 @@ import type {
   Conversation,
   Device,
   JarvisConfig,
+  McpCatalogDetail,
+  McpCatalogEntry,
+  McpServerEntry,
+  McpStatus,
   Peripheral,
   RemStatus,
+  MemoryFiles,
+  MemoryListResponse,
+  MemoryStats,
 } from "./types";
 
 // In the Vite dev server we use its proxy (same origin). Elsewhere (e.g. the Tauri
@@ -108,6 +115,63 @@ export const api = {
 
   listDevices: () => fetch(`${API}/api/devices`).then((r) => json<Device[]>(r)),
 
+  mcpStatus: () => fetch(`${API}/api/mcp/status`).then((r) => json<McpStatus>(r)),
+  mcpRefresh: () =>
+    fetch(`${API}/api/mcp/refresh`, { method: "POST" }).then((r) =>
+      json<{ ok: boolean; imported_tool_count: number }>(r)
+    ),
+  mcpTestServer: (server: McpServerEntry) =>
+    fetch(`${API}/api/mcp/servers/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: server.id,
+        name: server.name,
+        url: server.url,
+        enabled: server.enabled,
+        headers: server.headers ?? {},
+      }),
+    }).then((r) => json<{ ok: boolean; connected: boolean; error?: string; tools: McpStatus["servers"][0]["tools"] }>(r)),
+
+  mcpCatalogSearch: (q = "", limit = 24) =>
+    fetch(`${API}/api/mcp/catalog?q=${encodeURIComponent(q)}&limit=${limit}`).then((r) =>
+      json<{ query: string; count: number; items: McpCatalogEntry[] }>(r)
+    ),
+
+  mcpCatalogDetail: (entryId: string) =>
+    fetch(`${API}/api/mcp/catalog/${encodeURIComponent(entryId)}`).then((r) => {
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return json<McpCatalogDetail>(r);
+    }),
+
+  mcpCatalogInstall: (body: {
+    catalog_id: string;
+    url?: string;
+    authorization?: string;
+    name?: string;
+  }) =>
+    fetch(`${API}/api/mcp/catalog/install`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => {
+      if (!r.ok) {
+        return r.text().then((t) => {
+          throw new Error(t || r.statusText);
+        });
+      }
+      return json<{
+        ok: boolean;
+        already_installed: boolean;
+        server_id: string;
+        url: string;
+        name: string;
+        connected?: boolean;
+        error?: string;
+        tool_count?: number;
+      }>(r);
+    }),
+
   refreshDevice: () =>
     fetch(`${API}/api/devices/refresh`, { method: "POST" }).then((r) =>
       json<{ ok: boolean; hostname: string; summary: string }>(r)
@@ -168,4 +232,44 @@ export const api = {
     const data = (await r.json()) as { text?: string };
     return (data.text || "").trim();
   },
+
+  memoryStats: () =>
+    fetch(`${API}/api/memories/stats`).then((r) => json<MemoryStats>(r)),
+
+  memoryFiles: () =>
+    fetch(`${API}/api/memories/files`).then((r) => json<MemoryFiles>(r)),
+
+  listMemories: (opts: { kind?: string; q?: string; limit?: number; offset?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.kind) params.set("kind", opts.kind);
+    if (opts.q) params.set("q", opts.q);
+    if (opts.limit != null) params.set("limit", String(opts.limit));
+    if (opts.offset != null) params.set("offset", String(opts.offset));
+    const qs = params.toString();
+    return fetch(`${API}/api/memories${qs ? `?${qs}` : ""}`).then((r) =>
+      json<MemoryListResponse>(r)
+    );
+  },
+
+  deleteMemory: (id: number) =>
+    fetch(`${API}/api/memories/${id}`, { method: "DELETE" }).then((r) =>
+      json<{ ok: boolean }>(r)
+    ),
+
+  deleteMemories: (ids: number[]) =>
+    fetch(`${API}/api/memories/delete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }).then((r) => json<{ ok: boolean; deleted: number }>(r)),
+
+  wipeMemories: (opts: { kinds?: string[]; include_files?: boolean } = {}) =>
+    fetch(`${API}/api/memories/wipe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kinds: opts.kinds ?? null,
+        include_files: opts.include_files ?? false,
+      }),
+    }).then((r) => json<{ ok: boolean; deleted: number; files_cleared: boolean }>(r)),
 };

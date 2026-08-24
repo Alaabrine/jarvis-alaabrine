@@ -21,7 +21,27 @@
         "resizable": true,
         "center": true,
         "decorations": true,
-        "theme": "Dark"
+        "theme": "Dark",
+        "visible": true
+      },
+      {
+        "title": "JARVIS Listening",
+        "label": "overlay",
+        "url": "overlay.html",
+        "width": 280,
+        "height": 320,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "center": true,
+        "shadow": false,
+        "focus": false,
+        "maximizable": false,
+        "minimizable": false,
+        "closable": false
       }
     ],
     "security": {
@@ -31,6 +51,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

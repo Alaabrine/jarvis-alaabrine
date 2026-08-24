@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 import psutil
 
+from .appcatalog import get_catalog as _catalog
 from .config import Config, store
 from .memory import Memory
 
@@ -30,6 +31,7 @@ _APP_CANDIDATES = [
     "flatpak", "snap", "systemctl", "journalctl", "nmcli", "bluetoothctl",
     "pactl", "wpctl", "amixer", "brightnessctl", "xrandr", "swaymsg", "hyprctl",
     "playerctl", "powerprofilesctl", "upower", "rfkill", "iwconfig", "ip",
+    "openrgb", "polychromatic-cli", "razer-cli",
 ]
 
 # Utilities probed to build OS-specific control hints.
@@ -56,6 +58,19 @@ _CONTROL_PROBES: dict[str, str] = {
     "package_snap": "snap",
     "init_systemd": "systemctl",
     "wifi_rfkill": "rfkill",
+    "rgb_openrgb": "openrgb",
+    "rgb_polychromatic": "polychromatic-cli",
+    "rgb_razer": "razer-cli",
+    # GUI / computer-use
+    "gui_grim": "grim",
+    "gui_maim": "maim",
+    "gui_scrot": "scrot",
+    "gui_xdotool": "xdotool",
+    "gui_ydotool": "ydotool",
+    "gui_wtype": "wtype",
+    "gui_wl_clipboard": "wl-copy",
+    "gui_cliclick": "cliclick",
+    "gui_screencapture": "screencapture",
 }
 
 
@@ -131,6 +146,31 @@ def _control_capabilities() -> dict[str, Any]:
 
     if "brightness" in available:
         hints.append("Brightness: brightnessctl set 50% ; brightnessctl set +10% ; brightnessctl set 10%-")
+        hints.append(
+            "Keyboard backlight: brightnessctl --device='*:kbd_backlight' set 50% "
+            "(or peripherals control command=brightness on the keyboard)"
+        )
+
+    if "rgb_openrgb" in available:
+        hints.append(
+            "RGB lighting: openrgb --list-devices ; openrgb --device 0 --mode rainbow "
+            "(or peripherals control command=lighting value=rainbow)"
+        )
+    elif "rgb_polychromatic" in available:
+        hints.append(
+            "RGB lighting: polychromatic-cli -d keyboard -o spectrum "
+            "(or peripherals control command=lighting value=rainbow)"
+        )
+    elif "rgb_razer" in available:
+        hints.append(
+            "RGB lighting: razer-cli effect spectrum "
+            "(or peripherals control command=lighting value=rainbow)"
+        )
+    else:
+        hints.append(
+            "RGB lighting: no OpenRGB/OpenRazer CLI detected. Prefer peripherals "
+            "control command=lighting; install openrgb or polychromatic if RGB effects fail."
+        )
 
     if "display_wayland_hypr" in available:
         hints.append("Hyprland: hyprctl dispatch exec <app> ; hyprctl clients")
@@ -181,7 +221,21 @@ def _control_capabilities() -> dict[str, Any]:
 
     opener = "xdg-open" if os_name == "Linux" else "open" if os_name == "Darwin" else "start"
     if shutil.which(opener.split()[0]) or os_name == "Windows":
-        hints.append(f"Open URL/app: {opener} <url-or-app>")
+        hints.append(
+            f"Open URL/app: device_control action=open (or {opener} <url-or-app>) "
+            "— do not use computer_use just to launch a browser/URL."
+        )
+
+    # GUI computer-use capability summary (native backends in jarvis.computer).
+    try:
+        from .computer import format_computer_hints
+
+        hints.extend(format_computer_hints())
+    except Exception:  # noqa: BLE001
+        hints.append(
+            "GUI: use computer_use (screenshot → click/type). "
+            "On Wayland install grim + ydotool; on X11 install maim + xdotool."
+        )
 
     return {"available": available, "hints": hints}
 
@@ -256,6 +310,7 @@ def scan_device() -> dict[str, Any]:
         "network_interfaces": net_ifaces,
         "battery": battery,
         "installed_apps": _installed_apps(),
+        "applications": [a.as_dict() for a in _catalog().apps(refresh=True)[:250]],
         "boot_time": psutil.boot_time(),
         "desktop": desktop,
         "init_system": init_sys,
@@ -286,13 +341,16 @@ def profile_summary(profile: dict[str, Any]) -> str:
     de = desktop.get("XDG_CURRENT_DESKTOP") or desktop.get("DESKTOP_SESSION") or "unknown"
     caps = profile.get("control_capabilities") or {}
     hint_count = len(caps.get("hints") or [])
+    installed = profile.get("applications") or []
+    gui = [a for a in installed if a.get("kind") != "cli"]
     return (
         f"Device '{profile['hostname']}' ({profile['os']} {profile['os_release']}, "
         f"{profile['architecture']}, {de}): "
         f"{profile['cpu_cores_logical']} CPUs, {profile['memory_total_gb']} GB RAM, "
         f"user={profile.get('user')}. "
         f"Control utilities: {len(caps.get('available') or {})} detected, "
-        f"{hint_count} control hints. Apps: {apps}."
+        f"{hint_count} control hints. "
+        f"Applications: {len(gui)} launchable GUI apps catalogued. Tools: {apps}."
     )
 
 
@@ -334,13 +392,22 @@ def format_device_context(profile: dict[str, Any]) -> str:
     caps = profile.get("control_capabilities") or {}
     hints = caps.get("hints") or []
     if hints:
-        lines.append("\nHow to control this device (use device_control with shell/open actions):")
+        lines.append(
+            "\nHow to control this device "
+            "(device_control for shell/files; computer_use for GUI; peripherals for hardware):"
+        )
         for h in hints:
             lines.append(f"  • {h}")
 
+    app_ctx = _catalog().context()
+    if app_ctx:
+        lines.append("")
+        lines.append(app_ctx)
+
     lines.append(
-        "\nYou already know this machine. Control it directly via device_control — "
-        "do not ask to scan it first. When you discover new control methods, call remember."
+        "\nYou already know this machine. Control it directly via device_control / "
+        "computer_use / peripherals — do not ask to scan it first. When you discover "
+        "new control methods, call remember."
     )
     return "\n".join(lines)
 
@@ -402,10 +469,33 @@ class DeviceLearner:
                     embedding = None
             self.memory.add_memory("device", summary, embedding)
 
+            # Store what each purpose-bearing application is for, so a later request
+            # phrased by purpose ("edit a photo") can recall the app that serves it.
+            for app in _catalog().apps():
+                if not app.aliases:
+                    continue
+                text = (
+                    f"Application on {profile['hostname']}: {app.name} "
+                    f"({app.kind}:{app.id}) — {app.purpose() or 'installed application'}. "
+                    f"Use it for: {', '.join(app.aliases[:6])}. "
+                    f"Launch: device_control action=open app={app.id}"
+                )
+                if self.memory.has_memory("application", text):
+                    continue
+                app_emb = None
+                if llm is not None:
+                    try:
+                        app_emb = await llm.embed(text)
+                    except Exception:  # noqa: BLE001
+                        app_emb = None
+                self.memory.add_memory("application", text, app_emb)
+
             # Store individual control hints as retrievable memories.
             caps = profile.get("control_capabilities") or {}
             for hint in caps.get("hints") or []:
                 text = f"Control on {profile['hostname']}: {hint}"
+                if self.memory.has_memory("device_control", text):
+                    continue
                 hint_emb = None
                 if llm is not None:
                     try:

@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 import httpx
 
-from .agent import Agent
+from .agent import Agent, RunControl
 from .config import DATA_DIR, store
 from .memory import Memory
 
@@ -48,7 +48,7 @@ class TelegramBotService:
         self._client: httpx.AsyncClient | None = None
         self._offset = 0
         self._sessions: dict[str, int] = {}
-        self._active: dict[int, tuple[asyncio.Task, asyncio.Event]] = {}
+        self._active: dict[int, tuple[asyncio.Task, RunControl]] = {}
         self._pending_confirm: dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
 
@@ -377,22 +377,28 @@ class TelegramBotService:
         entry = self._active.get(chat_id)
         if not entry:
             return
-        task, cancel = entry
-        cancel.set()
+        task, control = entry
+        control.interrupt()
         task.cancel()
 
     async def _run_agent(self, chat_id: int, text: str, attachments: list[dict] | None) -> None:
         async with self._lock:
-            # One active turn per chat — interrupt the previous.
+            existing = self._active.get(chat_id)
+            if existing is not None and not attachments:
+                _task, control = existing
+                if not _task.done():
+                    control.inject(text)
+                    return
             self._interrupt_chat(chat_id)
 
         cid = self._conversation_for(chat_id)
-        cancel = asyncio.Event()
+        control = RunControl()
+        control.conversation_id = cid
         task = asyncio.create_task(
-            self._handle_message(chat_id, cid, text, cancel, attachments),
+            self._handle_message(chat_id, cid, text, control, attachments),
             name=f"tg-agent-{chat_id}",
         )
-        self._active[chat_id] = (task, cancel)
+        self._active[chat_id] = (task, control)
 
         def _done(t: asyncio.Task, c: int = chat_id) -> None:
             self._active.pop(c, None)
@@ -404,13 +410,13 @@ class TelegramBotService:
         chat_id: int,
         conversation_id: int,
         text: str,
-        cancel: asyncio.Event,
+        control: RunControl,
         attachments: list[dict] | None,
     ) -> None:
         self._rem_touch()
         self._begin_run()
         await self._typing(chat_id)
-        typing_task = asyncio.create_task(self._typing_heartbeat(chat_id, cancel))
+        typing_task = asyncio.create_task(self._typing_heartbeat(chat_id, control.cancel))
 
         notify = bool(store.get().telegram.notify_tools)
 
@@ -418,10 +424,21 @@ class TelegramBotService:
             etype = event.get("type")
             if etype == "assistant":
                 await self._send_text(chat_id, event.get("text") or "")
+            elif etype == "say":
+                await self._send_text(chat_id, event.get("text") or "")
+            elif etype == "suggestions":
+                items = event.get("items") or []
+                lines = [
+                    f"• {item.get('label')}: {item.get('prompt')}"
+                    for item in items
+                    if isinstance(item, dict) and (item.get("label") or item.get("prompt"))
+                ]
+                if lines:
+                    await self._send_text(chat_id, "If you want, I can also:\n" + "\n".join(lines))
             elif etype == "error":
                 await self._send_text(chat_id, f"⚠️ {event.get('message') or 'Error'}")
             elif etype == "interrupted":
-                await self._send_text(chat_id, "Interrupted.")
+                await self._send_text(chat_id, event.get("message") or "Interrupted.")
             elif etype == "status" and notify:
                 state = event.get("state")
                 if state == "awaiting_confirmation":
@@ -452,6 +469,7 @@ class TelegramBotService:
         async def confirm(call: dict) -> bool:
             preview = call.get("preview") or json.dumps(call.get("args") or {}, indent=2)[:1500]
             name = call.get("name") or "action"
+            risk = call.get("risk") or "This is irreversible."
             call_id = str(call.get("id") or "")
             keyboard = {
                 "inline_keyboard": [
@@ -463,7 +481,7 @@ class TelegramBotService:
             }
             await self._send_text(
                 chat_id,
-                f"Confirmation required: `{name}`\n\n{preview}",
+                f"{risk}\n`{name}`\n\n{preview}",
                 parse_mode="Markdown",
                 reply_markup=keyboard,
             )
@@ -485,7 +503,7 @@ class TelegramBotService:
                 text,
                 emit,
                 confirm,
-                cancel=cancel,
+                control=control,
                 attachments=attachments,
             )
         except asyncio.CancelledError:
@@ -494,7 +512,7 @@ class TelegramBotService:
             log.exception("Telegram agent failure")
             await emit({"type": "error", "message": f"Agent failure: {exc}"})
         finally:
-            cancel.set()
+            control.interrupt()
             typing_task.cancel()
             try:
                 await typing_task
@@ -538,6 +556,8 @@ def _help_text() -> str:
         "/status — busy / conversation info\n"
         "/whoami — show your chat_id and user_id\n"
         "/help — this message\n\n"
-        "Send text or a photo (with optional caption). "
-        "Destructive tools will ask you to Approve / Deny here."
+        "Send text or a photo (with optional caption) at any time — including while "
+        "JARVIS is working, to elaborate, follow up, or redirect. "
+        "Say stop or /cancel to abort. Irreversible actions (delete, overwrite, "
+        "shutdown/reboot, send email) will ask you to Approve / Deny here."
     )

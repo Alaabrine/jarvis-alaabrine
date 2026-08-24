@@ -1,0 +1,88 @@
+html,
+body,
+#root {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+}
+
+.overlay-root {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  user-select: none;
+  cursor: default;
+}
+
+.orb {
+  position: relative;
+  width: 128px;
+  height: 128px;
+}
+
+.orb-core {
+  position: absolute;
+  inset: 34px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #bff4ff, #38e6ff 55%, #2b7bff);
+  box-shadow:
+    0 0 28px #38e6ff,
+    0 0 64px rgba(43, 123, 255, 0.55);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+.orb-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(56, 230, 255, 0.55);
+  animation: spin 6s linear infinite;
+}
+
+.orb-ring-2 {
+  inset: 16px;
+  border-style: dashed;
+  animation-direction: reverse;
+  animation-duration: 9s;
+}
+
+.overlay-title {
+  margin: 8px 0 0;
+  color: #eaf7ff;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  font-size: 13px;
+  text-shadow: 0 0 12px rgba(56, 230, 255, 0.55);
+}
+
+.overlay-hint {
+  margin: 0;
+  color: #6f8bad;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.14);
+    opacity: 0.75;
+  }
+}

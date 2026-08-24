@@ -168,6 +168,8 @@ class TaskManager:
             return {"t": now, "type": "error", "text": (event.get("message") or "")[:_LOG_TEXT_CAP]}
         if etype == "assistant":
             return {"t": now, "type": "report", "text": (event.get("text") or "")[:_LOG_TEXT_CAP]}
+        if etype == "say":
+            return {"t": now, "type": "say", "text": (event.get("text") or "")[:_LOG_TEXT_CAP]}
         return None
 
     # --- Shell runner ------------------------------------------------------

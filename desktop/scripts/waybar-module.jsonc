@@ -1,0 +1,19 @@
+// Drop this object into your Waybar config (usually ~/.config/waybar/config.jsonc)
+// and add "custom/jarvis" to modules-right. Clicking it summons the console
+// (requires ~/.local/bin/jarvis — created when the desktop app starts).
+//
+// Also enable Waybar's built-in "tray" module so the JARVIS tray icon is visible
+// while the console is closed.
+// Waybar style.css (optional):
+// #custom-jarvis.idle { color: #38e6ff; }
+// #custom-jarvis.busy { color: #3affc2; }
+// #custom-jarvis.offline { color: #ff5470; }
+{
+  "custom/jarvis": {
+    "exec": "$HOME/.jarvis/waybar.sh",
+    "interval": 3,
+    "return-type": "json",
+    "on-click": "jarvis",
+    "tooltip": true
+  }
+}

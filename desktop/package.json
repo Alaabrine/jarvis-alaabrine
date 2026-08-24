@@ -4,8 +4,9 @@
   "version": "0.1.0",
   "scripts": {
     "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build"
+    "check:linux": "bash scripts/check-linux-deps.sh",
+    "dev": "npm run check:linux && tauri dev",
+    "build": "npm run check:linux && tauri build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.1.0"

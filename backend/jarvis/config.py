@@ -104,7 +104,7 @@ EmailConfig = EmailProfile
 class PermissionsConfig:
     """Safety / privilege settings editable from the UI."""
 
-    # When True, gated (destructive) tool calls run without an Approve/Deny prompt.
+    # When True, even irreversible tool calls run without an Approve/Deny prompt.
     auto_approve: bool = field(default_factory=lambda: _env_bool("JARVIS_AUTO_APPROVE", False))
     # Optional sudo password so JARVIS can run `sudo` via `sudo -S` (stdin). Stored locally.
     sudo_password: str = field(default_factory=lambda: _env("JARVIS_SUDO_PASSWORD"))
@@ -166,6 +166,45 @@ def _parse_id_list(raw: str) -> list[str]:
 
 
 @dataclass
+class McpServerEntry:
+    """A configured MCP server — remote (Streamable HTTP) or local (stdio subprocess)."""
+
+    id: str = "server-1"
+    name: str = "MCP server"
+    url: str = ""
+    enabled: bool = True
+    # Optional HTTP headers (Authorization, X-API-Key, …) for remote servers.
+    headers: dict[str, str] = field(default_factory=dict)
+    # "http" (default, uses url) or "stdio" (spawns command + args locally).
+    transport: str = "http"
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: str = ""
+
+    @property
+    def is_stdio(self) -> bool:
+        return (self.transport or "http").lower() == "stdio" or (
+            not self.url.strip() and bool(self.command.strip())
+        )
+
+    @property
+    def target(self) -> str:
+        """Human-readable endpoint for logs and the UI."""
+        if self.is_stdio:
+            return " ".join([self.command, *self.args]).strip()
+        return self.url
+
+
+@dataclass
+class McpConfig:
+    """Model Context Protocol settings — expose JARVIS and import remote tools."""
+
+    enabled: bool = field(default_factory=lambda: _env_bool("JARVIS_MCP_ENABLED", True))
+    servers: list[McpServerEntry] = field(default_factory=list)
+
+
+@dataclass
 class TelegramConfig:
     """Remote chat via Telegram Bot API (outbound long-polling; no port exposure)."""
 
@@ -204,6 +243,7 @@ class Config:
     tts: TtsConfig = field(default_factory=TtsConfig)
     stt: SttConfig = field(default_factory=SttConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    mcp: McpConfig = field(default_factory=McpConfig)
 
     def get_email_profile(self, profile_ref: str | None = None) -> EmailProfile:
         """Resolve a profile by id or name; falls back to the default profile."""
@@ -300,11 +340,99 @@ class ConfigStore:
                 for k, v in value.items():
                     if hasattr(cfg.stt, k) and v is not None:
                         setattr(cfg.stt, k, str(v))
+            elif key == "mcp" and isinstance(value, dict):
+                ConfigStore._apply_mcp(cfg, value)
             elif key == "telegram" and isinstance(value, dict):
                 ConfigStore._apply_telegram(cfg, value)
             elif hasattr(cfg, key) and key not in {"email"}:
                 setattr(cfg, key, value)
         ConfigStore._ensure_email_accounts(cfg)
+
+    @staticmethod
+    def _apply_mcp(cfg: Config, value: dict) -> None:
+        mcp = cfg.mcp
+        if "enabled" in value:
+            mcp.enabled = bool(value["enabled"])
+        raw_servers = value.get("servers")
+        if not isinstance(raw_servers, list):
+            return
+        servers: list[McpServerEntry] = []
+        seen: set[str] = set()
+        existing = {s.id: s for s in mcp.servers}
+        for raw in raw_servers:
+            if not isinstance(raw, dict):
+                continue
+            sid = str(raw.get("id") or "").strip() or f"server-{len(servers) + 1}"
+            if sid in seen:
+                sid = f"{sid}-{len(servers) + 1}"
+            seen.add(sid)
+            headers_raw = raw.get("headers") or {}
+            headers: dict[str, str] = {}
+            prev = existing.get(sid)
+            if isinstance(headers_raw, dict):
+                for key, value in headers_raw.items():
+                    k = str(key).strip()
+                    if not k:
+                        continue
+                    v = str(value)
+                    if v == "********" and prev and prev.headers.get(k):
+                        headers[k] = prev.headers[k]
+                    elif v != "********":
+                        headers[k] = v
+            # Clients that only know about remote servers (the Settings form) omit the
+            # local-server fields entirely. Carry the stored values through rather than
+            # silently unconfiguring a working stdio server.
+            if "env" in raw:
+                env_raw = raw.get("env") or {}
+                env: dict[str, str] = {}
+                if isinstance(env_raw, dict):
+                    for key, value in env_raw.items():
+                        k = str(key).strip()
+                        if not k:
+                            continue
+                        v = str(value)
+                        if v == "********" and prev and prev.env.get(k):
+                            env[k] = prev.env[k]
+                        elif v != "********":
+                            env[k] = v
+            else:
+                env = dict(prev.env) if prev else {}
+
+            if "args" in raw:
+                args_raw = raw.get("args") or []
+                args = [str(a) for a in args_raw] if isinstance(args_raw, list) else []
+            else:
+                args = list(prev.args) if prev else []
+
+            command = (
+                str(raw.get("command") or "").strip()
+                if "command" in raw
+                else (prev.command if prev else "")
+            )
+            cwd = (
+                str(raw.get("cwd") or "").strip()
+                if "cwd" in raw
+                else (prev.cwd if prev else "")
+            )
+            url = str(raw.get("url") or "").strip()
+            transport = str(raw.get("transport") or "").strip().lower()
+            if transport not in {"http", "stdio"}:
+                transport = "stdio" if command and not url else "http"
+            servers.append(
+                McpServerEntry(
+                    id=sid,
+                    name=str(raw.get("name") or sid),
+                    url=url,
+                    enabled=bool(raw.get("enabled", True)),
+                    headers=headers,
+                    transport=transport,
+                    command=command,
+                    args=args,
+                    env=env,
+                    cwd=cwd,
+                )
+            )
+        mcp.servers = servers
 
     @staticmethod
     def _apply_telegram(cfg: Config, value: dict) -> None:

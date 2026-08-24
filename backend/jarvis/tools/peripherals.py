@@ -4,34 +4,6 @@ from __future__ import annotations
 
 from .base import Tool, ToolContext, ToolResult, prop
 
-_SAFE_ACTIONS = {"list", "scan", "inspect", "remember"}
-_SAFE_COMMANDS = {
-    "volume",
-    "mute",
-    "unmute",
-    "play",
-    "pause",
-    "play-pause",
-    "next",
-    "previous",
-    "stop",
-    "brightness",
-}
-
-
-def _dangerous(args: dict) -> bool:
-    action = (args.get("action") or "").strip().lower()
-    if action in _SAFE_ACTIONS:
-        return False
-    if action in {"connect", "disconnect"}:
-        # Bluetooth connect to a known device / volume-like; pairing & Wi-Fi secrets are gated.
-        return False
-    if action == "control":
-        cmd = (args.get("command") or "").strip().lower()
-        return cmd not in _SAFE_COMMANDS
-    return True
-
-
 def _preview(args: dict) -> str:
     action = args.get("action", "?")
     target = args.get("target") or args.get("id") or ""
@@ -84,6 +56,68 @@ def _format_one(p: dict) -> str:
     return "\n".join(lines)
 
 
+async def _connect_autonomously(
+    learner,
+    target: str,
+    password: str,
+    ctx: ToolContext,
+) -> ToolResult:
+    """Get a device connected and actually in use, without step-by-step instructions.
+
+    Discovers the device if it is not in the inventory yet, pairs and trusts Bluetooth
+    devices that have never been paired, connects, and routes audio to a headset once
+    it is up — so "connect my headphones" is one call, not four.
+    """
+    steps: list[str] = []
+    p = learner.resolve(target)
+
+    if p is None:
+        steps.append("not in inventory — scanning, including a Bluetooth inquiry")
+        await learner.scan(llm=ctx.llm, reason="connect-discovery", discover=True)
+        p = learner.resolve(target)
+    if p is None:
+        items = learner.items or ctx.memory.list_peripherals()
+        names = ", ".join(str(i.get("name")) for i in items[:12]) or "none"
+        return ToolResult(
+            False,
+            f"No peripheral matching '{target}' even after a discovery scan. "
+            f"Known devices: {names}",
+        )
+
+    name = p.get("name") or target
+    if p.get("connected"):
+        steps.append("already connected")
+
+    # A Bluetooth device that was never paired cannot simply be connected.
+    if p.get("kind") == "bluetooth" and not p.get("paired"):
+        ok, output, p2 = await learner.act(p["id"], "pair", password=password)
+        steps.append(f"pair: {'ok' if ok else 'failed'}")
+        if not ok:
+            return ToolResult(False, f"Could not pair {name}.\n" + output + "\nSteps: " + "; ".join(steps))
+        p = p2 or p
+        ok_trust, _, p3 = await learner.act(p["id"], "trust")
+        steps.append(f"trust: {'ok' if ok_trust else 'skipped'}")
+        p = p3 or p
+
+    ok, output, p = await learner.act(p["id"], "connect", password=password)
+    steps.append(f"connect: {'ok' if ok else 'failed'}")
+    if not ok:
+        return ToolResult(False, f"Could not connect {name}.\n{output}\nSteps: " + "; ".join(steps))
+
+    # Connecting a headset is only useful if audio actually goes there.
+    p = learner.resolve(p.get("id") or target) or p
+    audio_words = ("headphone", "headset", "earbud", "speaker", "airpod", "buds")
+    if any(w in (p.get("name") or "").lower() for w in audio_words):
+        sink = learner.resolve(p.get("name") or target)
+        for candidate in (sink, p):
+            if candidate and candidate.get("kind") == "audio":
+                ok_def, _, _ = await learner.act(candidate["id"], "default")
+                steps.append(f"set as default audio output: {'ok' if ok_def else 'failed'}")
+                break
+
+    return ToolResult(True, f"{name} is connected.\nSteps: " + "; ".join(steps) + f"\n{output}".rstrip())
+
+
 async def _run(args: dict, ctx: ToolContext) -> ToolResult:
     learner = _learner()
     if learner is None:
@@ -134,7 +168,17 @@ async def _run(args: dict, ctx: ToolContext) -> ToolResult:
             return ToolResult(False, f"No peripheral matching '{target}'.")
         return ToolResult(True, f"Remembered about {p.get('name')}: {fact}")
 
-    if action in {"connect", "disconnect", "pair", "unpair", "trust"}:
+    if action in {"connect", "ensure", "use"}:
+        if not target:
+            return ToolResult(False, "connect requires target (id, MAC, name, or SSID).")
+        return await _connect_autonomously(
+            learner,
+            target,
+            (args.get("password") or "").strip(),
+            ctx,
+        )
+
+    if action in {"disconnect", "pair", "unpair", "trust"}:
         if not target:
             return ToolResult(False, f"{action} requires target (id, MAC, or name).")
         ok, output, p = await learner.act(
@@ -147,14 +191,21 @@ async def _run(args: dict, ctx: ToolContext) -> ToolResult:
         return ToolResult(ok, f"{action} {name}: {status}\n{output}")
 
     if action == "control":
-        if not target:
-            return ToolResult(False, "control requires target.")
         command = (args.get("command") or "").strip()
+        if not target:
+            cmd = command.lower()
+            if cmd in {
+                "lighting", "light", "lights", "rgb", "led", "backlight",
+                "rainbow", "spectrum", "wave", "brightness",
+            }:
+                target = "keyboard"
+            else:
+                return ToolResult(False, "control requires target.")
         if not command:
             return ToolResult(
                 False,
-                "control requires command (volume, mute, brightness, default, mount, "
-                "unmount, play, enable, …).",
+                "control requires command (volume, mute, brightness, lighting, rainbow, "
+                "default, mount, unmount, play, enable, …).",
             )
         ok, output, p = await learner.act(
             target,
@@ -181,16 +232,24 @@ peripherals = Tool(
         "removable storage, Wi-Fi networks, and LAN/mDNS neighbours. "
         "Actions: list (inventory), scan (refresh; set discover=true to inquire nearby Bluetooth), "
         "inspect (deep-learn one device and remember facts), "
-        "connect / disconnect / pair / unpair (Bluetooth, Wi-Fi, storage, network), "
-        "control (volume, mute, brightness, default, mount, play, enable, …), "
+        "connect (autonomous: discovers the device if unknown, pairs and trusts it if "
+        "never paired, connects, and routes audio to it if it is a headset — one call, "
+        "no need to list or scan first), "
+        "disconnect / pair / unpair (Bluetooth, Wi-Fi, storage, network), "
+        "control (volume, mute, brightness, lighting/rgb/rainbow/backlight, default, "
+        "mount, play, enable, …), "
         "remember (attach a fact to a device). "
+        "For keyboard lights use action=control command=lighting value=rainbow|spectrum|"
+        "wave|static|off|<percent> (target the keyboard or a lighting device). "
         "Match target by id, MAC, or name. Prefer this over inventing bluetoothctl/nmcli/pactl "
-        "commands — fall back to device_control shell only if a control hint is missing."
+        "commands — fall back to device_control shell only if a control hint is missing. "
+        "Call this tool to act on hardware; do not describe commands for the user to run."
     ),
     parameters={
         "action": prop(
             "string",
-            "One of: list, scan, inspect, connect, disconnect, pair, unpair, control, remember.",
+            "One of: list, scan, inspect, connect, disconnect, pair, unpair, control, "
+            "remember.",
         ),
         "target": prop(
             "string",
@@ -212,13 +271,15 @@ peripherals = Tool(
         ),
         "command": prop(
             "string",
-            "For control: volume, mute, unmute, brightness, default, mount, unmount, "
-            "play, pause, next, previous, enable, disable, print, power.",
+            "For control: volume, mute, unmute, brightness, lighting, rainbow, rgb, "
+            "backlight, default, mount, unmount, play, pause, next, previous, enable, "
+            "disable, print, power.",
             optional=True,
         ),
         "value": prop(
             "string",
-            "Control argument (e.g. 50% for volume, file path for print) or a fact to remember.",
+            "Control argument (e.g. 50% for volume, rainbow/spectrum/off for lighting, "
+            "file path for print) or a fact to remember.",
             optional=True,
         ),
         "password": prop(
@@ -229,6 +290,5 @@ peripherals = Tool(
         "fact": prop("string", "Fact to remember about the target (action=remember).", optional=True),
     },
     run=_run,
-    dangerous=_dangerous,
     preview=_preview,
 )

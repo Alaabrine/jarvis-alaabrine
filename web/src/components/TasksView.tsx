@@ -50,10 +50,10 @@ export function TasksView({
     <section className="tasks-view">
       <div className="tasks-view-head">
         <div className="tasks-view-title">
-          <h2>Subagent Operations</h2>
+          <h2>Operations</h2>
           <span className="tasks-view-sub">
             {running.length === 0
-              ? "No subagents currently deployed."
+              ? "No subagents currently deployed. Ask me to handle something long-running."
               : `${running.length} subagent${running.length > 1 ? "s" : ""} working in the background.`}
           </span>
         </div>
@@ -68,7 +68,7 @@ export function TasksView({
             <strong>{finished.filter((t) => t.status !== "completed").length}</strong> other
           </span>
           <button type="button" className="btn btn-ghost" onClick={onBack}>
-            Back to console
+            Close
           </button>
         </div>
       </div>
@@ -77,8 +77,8 @@ export function TasksView({
         <h3 className="tasks-section-title">Active</h3>
         {running.length === 0 && (
           <p className="tasks-empty">
-            Nothing running. Ask JARVIS to handle something long-running — research, builds,
-            downloads — and the subagent will appear here with a live log.
+            Nothing running. Ask me to handle something long-running — research, builds,
+            downloads — and I will deploy a subagent here with a live log.
           </p>
         )}
         {running.map((t) => (

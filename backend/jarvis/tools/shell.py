@@ -1,8 +1,12 @@
-"""Arbitrary shell command execution. Read-only commands run automatically; anything
-that may modify the system requires confirmation (unless auto-approve is enabled).
+"""Arbitrary shell command execution.
+
+Most commands run immediately. Only irreversible operations (delete/overwrite,
+disk destroyers, shutdown/reboot) require confirmation unless auto-approve is on.
 
 When a sudo password is configured, ``sudo`` commands are rewritten to ``sudo -S`` and
 the password is supplied on stdin (never logged or returned in tool output).
+Sudo without a saved password is a config miss — the command is not run, and no
+Approve dialog is shown.
 """
 
 from __future__ import annotations
@@ -13,38 +17,50 @@ import shlex
 
 from .base import Tool, ToolContext, ToolResult, prop
 
-# Commands considered read-only / safe to run without confirmation.
-_SAFE_COMMANDS = {
-    "ls", "cat", "pwd", "whoami", "id", "date", "uptime", "df", "du", "free",
-    "ps", "top", "env", "printenv", "uname", "hostname", "which", "echo",
-    "head", "tail", "wc", "stat", "file", "grep", "rg", "find", "tree",
-    "ip", "ifconfig", "netstat", "ss", "lscpu", "lsblk", "lsusb", "nvidia-smi",
-    "git", "python", "python3", "node", "pip", "pip3",
+# Basenames that always pause for Approve (unless auto-approve).
+_HARD_GATE_BASENAMES = {
+    "rm",
+    "rmdir",
+    "unlink",
+    "mv",
+    "dd",
+    "tee",
+    "shred",
+    "wipefs",
+    "shutdown",
+    "reboot",
+    "poweroff",
+    "halt",
 }
-# Even "safe" base commands are dangerous with these tokens present.
-_DANGEROUS_TOKENS = {">", ">>", "rm", "mv", "dd", "mkfs", "sudo", "chmod", "chown", "kill",
-                     "shutdown", "reboot", "|", "&", ";", "install", "uninstall"}
 
 _SUDO_RE = re.compile(r"(^|[\s;|&])sudo(?=\s)")
+_REDIRECT_RE = re.compile(r"(?:^|[\s;|&]|\d)(?:>>?)(?!=)")
+_SUDO_MISS = (
+    "This command needs sudo, but no sudo password is configured. "
+    "Add one under Configuration → Permissions, or run the command without sudo."
+)
 
 
 def _is_dangerous(args: dict) -> bool:
-    command = args.get("command", "")
+    """True only for irreversible shell (delete, overwrite, disk wipe, power)."""
+    command = args.get("command", "") or ""
+    if _REDIRECT_RE.search(command):
+        return True
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return True
+        low = command.lower()
+        return any(
+            name in low
+            for name in ("rm ", "mv ", "dd ", "mkfs", "shutdown", "reboot", "poweroff", "halt")
+        )
     if not tokens:
-        return True
-    if any(tok in _DANGEROUS_TOKENS for tok in tokens):
-        return True
-    base = tokens[0].split("/")[-1]
-    # git/pip/python are only "safe" for read operations; be conservative on subcommands.
-    if base in {"git"} and len(tokens) > 1 and tokens[1] in {"push", "reset", "clean", "rebase", "commit", "checkout"}:
-        return True
-    if base in {"pip", "pip3"} and len(tokens) > 1 and tokens[1] in {"install", "uninstall"}:
-        return True
-    return base not in _SAFE_COMMANDS
+        return False
+    for tok in tokens:
+        base = tok.split("/")[-1].lower()
+        if base in _HARD_GATE_BASENAMES or base.startswith("mkfs"):
+            return True
+    return False
 
 
 def _uses_sudo(command: str) -> bool:
@@ -84,11 +100,7 @@ async def _run(args: dict, ctx: ToolContext) -> ToolResult:
 
     if _uses_sudo(command):
         if not password:
-            return ToolResult(
-                False,
-                "This command needs sudo, but no sudo password is configured. "
-                "Add one under Configuration → Permissions, or run the command without sudo.",
-            )
+            return ToolResult(False, _SUDO_MISS)
         command = _with_sudo_stdin(command)
         stdin_data = (password + "\n").encode()
 

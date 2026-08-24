@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import signal
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -11,13 +14,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from .agent import Agent
+from .agent import Agent, RunControl
 from .config import store
 from .device import init_learner, profile_summary
+from .mcp_client import get_manager, mcp_endpoint_url, startup_refresh
+from .mcp_server import McpDeps, init_mcp, mcp_http_app, mcp_session_lifespan
 from .peripherals import init_learner as init_peripheral_learner
 from .media import resolve_media_path
 from .memory import Memory
-from .rem import RemSleepService
+from .rem import RemSleepService, read_memory_files, wipe_memory_files
 from .stt import transcribe as stt_transcribe
 from .tasks import init_manager
 from .telegram_bot import TelegramBotService
@@ -37,6 +42,21 @@ telegram_bot = TelegramBotService(
     begin_run=lambda: _bump_runs(+1),
     end_run=lambda: _bump_runs(-1),
 )
+
+_mcp_enabled = store.get().mcp.enabled
+if _mcp_enabled:
+    init_mcp(
+        McpDeps(
+            memory=memory,
+            tasks=task_manager,
+            rem_touch=lambda: rem_service.touch(),
+            begin_run=lambda: _bump_runs(+1),
+            end_run=lambda: _bump_runs(-1),
+            peripheral_items=lambda: (
+                peripheral_learner.items or memory.list_peripherals()
+            ),
+        )
+    )
 
 
 def _bump_runs(delta: int) -> None:
@@ -63,17 +83,26 @@ async def lifespan(app: FastAPI):
     device_learner.on_event(_broadcast)
     peripheral_learner.on_event(_broadcast)
     task_manager.fail_orphans()
+
+    mcp_stack = contextlib.AsyncExitStack()
+    if _mcp_enabled:
+        await mcp_stack.enter_async_context(mcp_session_lifespan())
+
     if store.get().device.auto_learn:
         device_learner.start()
         if store.get().device.scan_peripherals:
             peripheral_learner.start()
     rem_service.start()
     await telegram_bot.start()
-    yield
-    device_learner.stop()
-    peripheral_learner.stop()
-    await telegram_bot.stop()
-    rem_service.stop()
+    await startup_refresh()
+    try:
+        yield
+    finally:
+        device_learner.stop()
+        peripheral_learner.stop()
+        await telegram_bot.stop()
+        rem_service.stop()
+        await mcp_stack.aclose()
 
 
 app = FastAPI(title="JARVIS", version="0.1.0", lifespan=lifespan)
@@ -84,10 +113,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+if _mcp_enabled:
+    app.mount("/mcp", mcp_http_app())
+
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"status": "online", "name": "JARVIS"}
+    return {
+        "status": "online",
+        "name": "JARVIS",
+        "busy": _active_runs > 0,
+        "tasks": task_manager.active_count(),
+    }
+
+
+@app.post("/api/shutdown")
+async def shutdown() -> dict:
+    """Graceful shutdown for the desktop shell (runs lifespan cleanup)."""
+
+    async def _exit() -> None:
+        await asyncio.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    asyncio.create_task(_exit())
+    return {"ok": True}
 
 
 @app.get("/api/config")
@@ -108,12 +157,16 @@ async def update_config(update: ConfigUpdate) -> dict:
         raise HTTPException(400, "Invalid config payload")
     prev_tg = store.as_dict().get("telegram") or {}
     prev_dev = store.as_dict().get("device") or {}
+    prev_mcp = store.as_dict().get("mcp") or {}
     store.update(data)
     new_tg = store.as_dict().get("telegram") or {}
     new_dev = store.as_dict().get("device") or {}
+    new_mcp = store.as_dict().get("mcp") or {}
     # Restart the bot when Telegram settings change (token / enable / allowlist).
     if _telegram_settings_changed(prev_tg, new_tg):
         await telegram_bot.reload()
+    if prev_mcp != new_mcp:
+        await get_manager().refresh()
     if bool(prev_dev.get("scan_peripherals", True)) != bool(new_dev.get("scan_peripherals", True)):
         if new_dev.get("scan_peripherals", True) and store.get().device.auto_learn:
             peripheral_learner.start()
@@ -137,6 +190,149 @@ async def list_tools() -> list[dict]:
         {"name": t.name, "description": t.description, "dangerous": bool(t.dangerous is True or callable(t.dangerous))}
         for t in all_tools()
     ]
+
+
+@app.get("/api/mcp/status")
+async def mcp_status() -> dict:
+    mgr = get_manager()
+    exposed = [
+        {"name": t.name, "description": t.description, "dangerous": bool(t.dangerous is True or callable(t.dangerous))}
+        for t in all_tools()
+        if t.name.startswith("mcp_")
+    ]
+    core = [
+        {"name": t.name, "description": t.description, "dangerous": bool(t.dangerous is True or callable(t.dangerous))}
+        for t in all_tools()
+        if not t.name.startswith("mcp_")
+    ]
+    configured = {e.id: e for e in store.get().mcp.servers}
+    servers = []
+    for s in mgr.status_list():
+        entry = configured.get(s.id)
+        servers.append({
+            "id": s.id,
+            "name": s.name,
+            "url": s.url,
+            "transport": "stdio" if (entry and entry.is_stdio) else "http",
+            "enabled": s.enabled,
+            "connected": s.connected,
+            "error": s.error,
+            "tools": s.tools,
+        })
+    cfg = store.get()
+    return {
+        "enabled": cfg.mcp.enabled,
+        "endpoint": mcp_endpoint_url(),
+        "servers": servers,
+        "imported_tool_count": len(mgr.proxy_tools()),
+        "exposed_tools": core,
+        "imported_tools": exposed,
+    }
+
+
+@app.post("/api/mcp/refresh")
+async def mcp_refresh() -> dict:
+    servers = await get_manager().refresh()
+    return {
+        "ok": True,
+        "imported_tool_count": len(get_manager().proxy_tools()),
+        "servers": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "connected": s.connected,
+                "error": s.error,
+                "tool_count": len(s.tools),
+            }
+            for s in servers
+        ],
+    }
+
+
+class McpServerTest(BaseModel):
+    id: str = ""
+    name: str = "MCP server"
+    url: str = ""
+    enabled: bool = True
+    headers: dict[str, str] = Field(default_factory=dict)
+    transport: str = ""
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str = ""
+
+
+@app.post("/api/mcp/servers/test")
+async def mcp_test_server(body: McpServerTest) -> dict:
+    from .config import McpServerEntry
+
+    command = body.command.strip()
+    transport = (body.transport or "").strip().lower()
+    if transport not in {"http", "stdio"}:
+        transport = "stdio" if command and not body.url.strip() else "http"
+    entry = McpServerEntry(
+        id=body.id or "test",
+        name=body.name,
+        url=body.url.strip(),
+        enabled=body.enabled,
+        headers=body.headers,
+        transport=transport,
+        command=command,
+        args=list(body.args),
+        env=dict(body.env),
+        cwd=body.cwd.strip(),
+    )
+    status = await get_manager().test_server(entry)
+    return {
+        "ok": status.connected,
+        "connected": status.connected,
+        "error": status.error,
+        "tools": status.tools,
+    }
+
+
+@app.get("/api/mcp/catalog")
+async def mcp_catalog_search(q: str = "", limit: int = 24) -> dict:
+    from .mcp_catalog import search_catalog
+
+    items = await search_catalog(q, limit=min(max(limit, 1), 50))
+    return {"query": q, "count": len(items), "items": items}
+
+
+@app.get("/api/mcp/catalog/{entry_id:path}")
+async def mcp_catalog_detail(entry_id: str) -> dict:
+    from .mcp_catalog import get_catalog_entry
+
+    detail = await get_catalog_entry(entry_id, probe_tools=True)
+    if detail is None:
+        raise HTTPException(404, "Catalog entry not found")
+    return detail
+
+
+class McpCatalogInstall(BaseModel):
+    catalog_id: str
+    url: str | None = None
+    authorization: str | None = None
+    name: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    prefer: str = "auto"
+
+
+@app.post("/api/mcp/catalog/install")
+async def mcp_catalog_install(body: McpCatalogInstall) -> dict:
+    from .mcp_catalog import install_catalog_entry
+
+    try:
+        return await install_catalog_entry(
+            body.catalog_id.strip(),
+            url=body.url.strip() if body.url else None,
+            authorization=body.authorization.strip() if body.authorization else None,
+            name=body.name.strip() if body.name else None,
+            env=dict(body.env),
+            prefer=(body.prefer or "auto").strip().lower(),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/conversations")
@@ -279,6 +475,68 @@ async def api_peripheral_action(pid: str, body: PeripheralAction) -> dict:
     return {"ok": ok, "output": output, "peripheral": p}
 
 
+# --- Semantic memory bank -------------------------------------------------
+
+class MemoryDeleteRequest(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+
+
+class MemoryWipeRequest(BaseModel):
+    kinds: list[str] | None = None
+    include_files: bool = False
+
+
+@app.get("/api/memories/stats")
+async def api_memory_stats() -> dict:
+    stats = memory.memory_stats()
+    files = read_memory_files()
+    stats["has_memory_md"] = bool(files.get("memory_md", "").strip())
+    stats["has_dreams_md"] = bool(files.get("dreams_md", "").strip())
+    return stats
+
+
+@app.get("/api/memories/files")
+async def api_memory_files() -> dict:
+    return read_memory_files()
+
+
+@app.get("/api/memories")
+async def api_list_memories(
+    kind: str | None = None,
+    q: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> dict:
+    kinds = [k.strip() for k in (kind or "").split(",") if k.strip()] or None
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    items = memory.list_memories(kinds=kinds, query=q, limit=limit, offset=offset)
+    total = memory.count_memories(kinds=kinds, query=q)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@app.delete("/api/memories/{mid}")
+async def api_delete_memory(mid: int) -> dict:
+    if not memory.delete_memory(mid):
+        raise HTTPException(404, "Memory not found")
+    return {"ok": True}
+
+
+@app.post("/api/memories/delete")
+async def api_delete_memories(body: MemoryDeleteRequest) -> dict:
+    deleted = memory.delete_memories(body.ids)
+    return {"ok": True, "deleted": deleted}
+
+
+@app.post("/api/memories/wipe")
+async def api_wipe_memories(body: MemoryWipeRequest) -> dict:
+    kinds = [k.strip() for k in (body.kinds or []) if k.strip()] or None
+    deleted = memory.wipe_memories(kinds)
+    if body.include_files and not kinds:
+        wipe_memory_files()
+    return {"ok": True, "deleted": deleted, "files_cleared": bool(body.include_files and not kinds)}
+
+
 @app.get("/api/tasks")
 async def api_list_tasks(status: str | None = None) -> list[dict]:
     return task_manager.list_tasks(status)
@@ -379,7 +637,7 @@ async def chat_ws(ws: WebSocket) -> None:
     _ws_clients.add(ws)
     loop = asyncio.get_event_loop()
     pending: dict[str, asyncio.Future] = {}
-    active: dict[asyncio.Task, asyncio.Event] = {}
+    active: dict[asyncio.Task, RunControl] = {}
     global _active_runs
 
     async def emit(event: dict) -> None:
@@ -401,14 +659,14 @@ async def chat_ws(ws: WebSocket) -> None:
         for fut in list(pending.values()):
             if not fut.done():
                 fut.set_result(False)
-        for task, cancel in list(active.items()):
-            cancel.set()
+        for task, ctl in list(active.items()):
+            ctl.interrupt()
             task.cancel()
 
     async def handle_message(
         conversation_id: int,
         text: str,
-        cancel: asyncio.Event,
+        control: RunControl,
         attachments: list | None = None,
     ) -> None:
         global _active_runs
@@ -421,11 +679,11 @@ async def chat_ws(ws: WebSocket) -> None:
                 text,
                 emit,
                 confirm,
-                cancel=cancel,
+                control=control,
                 attachments=attachments,
             )
         except asyncio.CancelledError:
-            await emit({"type": "interrupted", "message": "Interrupted."})
+            await emit({"type": "interrupted", "message": "Very well — I'll stop there."})
             await emit({"type": "status", "state": "idle"})
             await emit({"type": "agent_end"})
         except Exception as exc:  # noqa: BLE001
@@ -448,22 +706,30 @@ async def chat_ws(ws: WebSocket) -> None:
             data = await ws.receive_json()
             mtype = data.get("type")
             if mtype == "user_message":
-                interrupt_all()
                 rem_service.touch()
                 cid = data.get("conversation_id")
+                text = data.get("text") or ""
+                attachments = data.get("attachments") or None
                 if cid is None:
                     cid = memory.create_conversation()
                     await emit({"type": "conversation_created", "id": cid})
-                cancel = asyncio.Event()
+                cid = int(cid)
+                live = [
+                    (task, ctl)
+                    for task, ctl in active.items()
+                    if not task.done() and ctl.conversation_id == cid
+                ]
+                if live and not attachments:
+                    for _task, ctl in live:
+                        ctl.inject(text)
+                    continue
+                interrupt_all()
+                control = RunControl()
+                control.conversation_id = cid
                 task = asyncio.create_task(
-                    handle_message(
-                        int(cid),
-                        data.get("text", ""),
-                        cancel,
-                        data.get("attachments") or None,
-                    )
+                    handle_message(cid, text, control, attachments)
                 )
-                active[task] = cancel
+                active[task] = control
                 task.add_done_callback(lambda t: active.pop(t, None))
             elif mtype == "interrupt":
                 interrupt_all()
@@ -495,6 +761,15 @@ def _strip_masked(data: dict | list) -> dict | list:
         else:
             out[key] = value
     return out
+
+
+_SECRET_ENV_HINTS = ("key", "token", "secret", "password", "passwd", "credential", "auth")
+
+
+def _looks_secret(name: str) -> bool:
+    """Env var names that should never be echoed back to the UI."""
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in _SECRET_ENV_HINTS)
 
 
 def _redact(cfg: dict) -> None:
@@ -532,3 +807,26 @@ def _redact(cfg: dict) -> None:
         tg["bot_token_configured"] = True
     else:
         tg["bot_token_configured"] = False
+    mcp = cfg.setdefault("mcp", {})
+    for server in mcp.get("servers") or []:
+        if not isinstance(server, dict):
+            continue
+        headers = server.get("headers") or {}
+        if not isinstance(headers, dict):
+            continue
+        redacted = False
+        for key, value in list(headers.items()):
+            if key.lower() in {"authorization", "x-api-key", "api-key"} and value:
+                headers[key] = "********"
+                redacted = True
+        if redacted:
+            server["headers_configured"] = True
+        env = server.get("env") or {}
+        if isinstance(env, dict):
+            env_redacted = False
+            for key, value in list(env.items()):
+                if value and _looks_secret(key):
+                    env[key] = "********"
+                    env_redacted = True
+            if env_redacted:
+                server["env_configured"] = True

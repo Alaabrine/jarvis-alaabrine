@@ -57,5 +57,9 @@ communicate = Tool(
     },
     run=_run,
     dangerous=_dangerous,
-    preview=lambda a: f"Email ({a.get('mode', 'send')}): {a.get('subject') or a.get('folder') or ''}",
+    preview=lambda a: (
+        f"Send email to {a.get('to') or '?'}: {a.get('subject') or '(no subject)'}"
+        if (a.get("mode") or "send").strip().lower() == "send"
+        else f"Email ({a.get('mode', 'send')}): {a.get('subject') or a.get('folder') or ''}"
+    ),
 )
