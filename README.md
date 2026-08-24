@@ -3,7 +3,7 @@
 A self-hosted, butler-style AI agent inspired by JARVIS from Iron Man.
 
 - **Local-first LLM** via [Odysseus](https://odysseus-dev.github.io/odysseus/) (any OpenAI-compatible endpoint), with a cloud API fallback.
-- **Full device control**: JARVIS learns your machine autonomously on startup (hardware, OS, desktop, control utilities) and acts on natural-language requests via unified control — no need to pick explicit tools or run a system scan.
+- **Full device control**: JARVIS learns your machine autonomously on startup and publishes an exhaustive catalogue of every action it can actually perform here — brightness, volume, Wi-Fi, Bluetooth, power, displays, media, services, packages, windows, clipboard, sensors — each already resolved to the right command for your OS, session, and installed tools. "Dim my screen" runs; it never comes back as a command for you to paste.
 - **Application catalogue**: every installed app is inventoried — native packages, Flatpaks, Snaps, Wine titles, macOS bundles — along with *what each one is for*, so "create a Roblox Studio project" opens Vinegar and "edit this photo" opens GIMP without you naming the program. If nothing installed fits, JARVIS finds the package and installs it.
 - **Self-provisioning MCP**: when a request needs an integration JARVIS doesn't have, it searches the public registries and installs one itself — remote Streamable HTTP, or **locally over stdio** via `npx`/`uvx`/`docker` — then calls the imported tools in the same turn.
 - **Computer use (GUI)**: screenshots + mouse/keyboard so JARVIS can complete arbitrary desktop tasks the way you would — click, type, scroll, switch windows — on Linux (Wayland/X11), macOS, or Windows.
@@ -223,6 +223,49 @@ inspect a USB camera. The **Peripherals** chip in the header shows the live inve
 "Connect my headphones" is a single call: `peripherals action=connect` discovers the
 device if it is not in the inventory yet, pairs and trusts it if it never was, connects
 it, and routes audio to it when it is a headset — no scan/pair/pick-a-sink sequence.
+
+### Device controls
+
+Learning the machine is not the same as knowing what to *do* with it. On every scan
+JARVIS probes the host against a catalogue of device actions and keeps the ones this
+machine can genuinely perform — one verified command per action, picking `wpctl` over
+`pactl` over `amixer`, `hyprctl` over `swaymsg` over `xrandr`, `pacman` over `apt`,
+according to what is actually installed:
+
+```
+device_control action=control  control=<id>  value=<v>
+device_control action=controls query=<word>          # search what this host can do
+```
+
+```
+display.brightness.set value=30        audio.volume.down value=10
+network.wifi.connect value=<ssid>      bluetooth.power.on
+power.profile.set value=performance    media.next
+session.workspace.switch value=3       packages.install value=<pkg>
+```
+
+A typical Arch/Hyprland laptop yields around 200 actions across Display, Audio, Media,
+Network, Bluetooth, Power, Services, System, Storage, Packages, Session, Input,
+Lighting, Peripherals and Containers. The catalogue is in the system prompt, so the
+model looks up an id instead of recalling shell syntax, and the value is validated
+before anything runs.
+
+Two things follow from this:
+
+**Direct requests execute directly.** "Dim my screen", "turn the volume down", "mute",
+"lock the screen" resolve to a catalogued action and run without a model round-trip —
+the wording is unambiguous and there is exactly one sensible execution. Questions
+("how do I dim my screen"), peripheral-scoped asks ("dim my *keyboard*"), and anything
+risky or privileged still go to the model.
+
+**A pasted command is treated as a mistake.** If a reply consists of a shell command
+rather than a report of work done, JARVIS runs it through the normal tool path —
+confirmation gates included — instead of handing it back to you.
+
+Actions this host is missing are listed too, with the package that unlocks them
+(`openrgb` → RGB lighting, `cups` → printing, `power-profiles-daemon` → power
+profiles), so JARVIS installs the package and completes the request rather than
+reporting the capability as unavailable.
 
 ### Application catalogue
 

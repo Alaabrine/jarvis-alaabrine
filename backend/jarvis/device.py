@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 import psutil
 
+from . import controls as _controls
 from .appcatalog import get_catalog as _catalog
 from .config import Config, store
 from .memory import Memory
@@ -61,6 +62,7 @@ _CONTROL_PROBES: dict[str, str] = {
     "rgb_openrgb": "openrgb",
     "rgb_polychromatic": "polychromatic-cli",
     "rgb_razer": "razer-cli",
+    "rgb_asusctl": "asusctl",
     # GUI / computer-use
     "gui_grim": "grim",
     "gui_maim": "maim",
@@ -137,82 +139,17 @@ def _control_capabilities() -> dict[str, Any]:
     os_name = platform.system()
     session = os.environ.get("XDG_SESSION_TYPE", "")
 
-    if "audio_pipewire" in available:
-        hints.append("Volume/mute: wpctl set-volume @DEFAULT_AUDIO_SINK@ 50% ; wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")
-    elif "audio_pulse" in available:
-        hints.append("Volume/mute: pactl set-sink-volume @DEFAULT_SINK@ 50% ; pactl set-sink-mute @DEFAULT_SINK@ toggle")
-    elif "audio_alsa" in available:
-        hints.append("Volume: amixer set Master 50% ; amixer set Master toggle")
-
-    if "brightness" in available:
-        hints.append("Brightness: brightnessctl set 50% ; brightnessctl set +10% ; brightnessctl set 10%-")
+    # Concrete command syntax for volume, brightness, Wi-Fi, services, packages and
+    # the rest now comes from the control catalogue (jarvis.controls), which probes
+    # this host and publishes one verified command per action. Only hints the
+    # catalogue cannot express — tool routing and session caveats — stay here.
+    if "rgb_openrgb" not in available and "rgb_polychromatic" not in available \
+            and "rgb_razer" not in available and "rgb_asusctl" not in available:
         hints.append(
-            "Keyboard backlight: brightnessctl --device='*:kbd_backlight' set 50% "
-            "(or peripherals control command=brightness on the keyboard)"
+            "RGB lighting: no OpenRGB/OpenRazer/asusctl CLI detected. Prefer peripherals "
+            "control command=lighting; install openrgb, polychromatic, or asusctl "
+            "(device_control action=control control=packages.install) if RGB effects fail."
         )
-
-    if "rgb_openrgb" in available:
-        hints.append(
-            "RGB lighting: openrgb --list-devices ; openrgb --device 0 --mode rainbow "
-            "(or peripherals control command=lighting value=rainbow)"
-        )
-    elif "rgb_polychromatic" in available:
-        hints.append(
-            "RGB lighting: polychromatic-cli -d keyboard -o spectrum "
-            "(or peripherals control command=lighting value=rainbow)"
-        )
-    elif "rgb_razer" in available:
-        hints.append(
-            "RGB lighting: razer-cli effect spectrum "
-            "(or peripherals control command=lighting value=rainbow)"
-        )
-    else:
-        hints.append(
-            "RGB lighting: no OpenRGB/OpenRazer CLI detected. Prefer peripherals "
-            "control command=lighting; install openrgb or polychromatic if RGB effects fail."
-        )
-
-    if "display_wayland_hypr" in available:
-        hints.append("Hyprland: hyprctl dispatch exec <app> ; hyprctl clients")
-    elif "display_wayland_sway" in available:
-        hints.append("Sway: swaymsg exec <app>")
-    elif "display_x11" in available:
-        hints.append("Display: xrandr --listmonitors ; xrandr --output <name> --brightness 0.8")
-
-    if "network_nm" in available:
-        hints.append("Wi-Fi: nmcli dev wifi list ; nmcli dev wifi connect <ssid> password <pass> ; nmcli radio wifi off|on")
-    elif "network_iw" in available:
-        hints.append("Wi-Fi: iw dev ; iw dev wlan0 scan")
-
-    if "bluetooth" in available:
-        hints.append("Bluetooth: bluetoothctl power on ; bluetoothctl scan on ; bluetoothctl pair <mac>")
-
-    if "media_player" in available:
-        hints.append("Media: playerctl play-pause ; playerctl next ; playerctl volume 0.5")
-
-    if "power_profiles" in available:
-        hints.append("Power profile: powerprofilesctl set balanced|power-saver|performance")
-
-    if "init_systemd" in available:
-        hints.append("Services: systemctl status/start/stop/restart <unit> ; journalctl -u <unit> -n 50")
-
-    if os_name == "Linux":
-        if "package_pacman" in available:
-            hints.append("Packages (Arch): pacman -S <pkg> ; pacman -Qs <query>")
-        elif "package_apt" in available:
-            hints.append("Packages (Debian/Ubuntu): apt install <pkg> ; apt search <query>")
-        elif "package_dnf" in available:
-            hints.append("Packages (Fedora): dnf install <pkg> ; dnf search <query>")
-        if "package_flatpak" in available:
-            hints.append("Flatpak: flatpak install ; flatpak run <app>")
-        if "package_snap" in available:
-            hints.append("Snap: snap install <pkg>")
-
-    if os_name == "Darwin":
-        hints.append("macOS: open -a <App> ; osascript for automation ; brew install <pkg>")
-
-    if os_name == "Windows":
-        hints.append("Windows: Start-Process ; Get-Process ; winget install <pkg>")
 
     if session == "wayland":
         hints.append("Session is Wayland — prefer wpctl/nmcli over legacy x-only tools.")
@@ -315,6 +252,8 @@ def scan_device() -> dict[str, Any]:
         "desktop": desktop,
         "init_system": init_sys,
         "control_capabilities": caps,
+        "controls": [c.id for c in _controls.available(refresh=True)],
+        "controls_installable": _controls.installable(),
         "user": os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
         "home": str(Path.home()),
         "shell": os.environ.get("SHELL") or "",
@@ -349,7 +288,8 @@ def profile_summary(profile: dict[str, Any]) -> str:
         f"{profile['cpu_cores_logical']} CPUs, {profile['memory_total_gb']} GB RAM, "
         f"user={profile.get('user')}. "
         f"Control utilities: {len(caps.get('available') or {})} detected, "
-        f"{hint_count} control hints. "
+        f"{len(profile.get('controls') or [])} verified control actions, "
+        f"{hint_count} routing hints. "
         f"Applications: {len(gui)} launchable GUI apps catalogued. Tools: {apps}."
     )
 
@@ -398,6 +338,23 @@ def format_device_context(profile: dict[str, Any]) -> str:
         )
         for h in hints:
             lines.append(f"  • {h}")
+
+    controls_ctx = _controls.format_controls_context()
+    if controls_ctx:
+        lines.append("")
+        lines.append(controls_ctx)
+
+    gaps = profile.get("controls_installable") or _controls.installable()
+    if gaps:
+        lines.append(
+            "\nControls this device could gain — install the package yourself with "
+            "device_control action=control control=packages.install value=<pkg>, then "
+            "perform the action. Do not report these as impossible:"
+        )
+        for gap in gaps[:12]:
+            lines.append(
+                f"  • {gap['package']} → {gap['unlocks']}"
+            )
 
     app_ctx = _catalog().context()
     if app_ctx:
@@ -489,6 +446,19 @@ class DeviceLearner:
                     except Exception:  # noqa: BLE001
                         app_emb = None
                 self.memory.add_memory("application", text, app_emb)
+
+            # Store every verified control action so a request phrased any which way
+            # ("how hot is it", "quieter") can recall the exact action that serves it.
+            for text in _controls.format_control_memories(profile["hostname"]):
+                if self.memory.has_memory("device_control", text):
+                    continue
+                ctl_emb = None
+                if llm is not None:
+                    try:
+                        ctl_emb = await llm.embed(text)
+                    except Exception:  # noqa: BLE001
+                        ctl_emb = None
+                self.memory.add_memory("device_control", text, ctl_emb)
 
             # Store individual control hints as retrievable memories.
             caps = profile.get("control_capabilities") or {}

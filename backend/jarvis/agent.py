@@ -274,12 +274,93 @@ _SHELL_IN_FENCE = re.compile(
     re.IGNORECASE,
 )
 
+def _command_heads() -> frozenset[str]:
+    """Every executable name a reply might be pasting instead of running."""
+    from . import controls as _ctl
+
+    extras = {
+        "modprobe", "insmod", "lsmod", "echo", "tee", "cat", "chmod", "chown",
+        "openrazer", "razer", "npm", "npx", "yarn", "pnpm", "mkdir", "vite",
+        "xdg-open", "xset", "setxkbmap", "wpctl", "pw-cli", "swaymsg", "hyprctl",
+        "systemctl", "journalctl", "nmcli", "bluetoothctl", "brightnessctl",
+    }
+    return frozenset(extras | _ctl.control_binaries())
+
+
+_COMMAND_HEADS = _command_heads()
+
 _SHELL_LINE = re.compile(
-    r"^(?:\$\s*)?(?:sudo\s+)?(?:modprobe|insmod|lsmod|pacman|apt(?:-get)?|dnf|systemctl|"
-    r"bluetoothctl|pactl|wpctl|brightnessctl|echo|tee|cat|chmod|openrazer|razer|"
-    r"polychromatic|openrgb|npm|npx|mkdir|vite)\b",
+    r"^(?:\$\s*)?(?:sudo\s+)?(?:"
+    + "|".join(sorted((re.escape(h) for h in _COMMAND_HEADS), key=len, reverse=True))
+    + r")\b",
     re.IGNORECASE | re.MULTILINE,
 )
+
+_CMD_PREFIX = re.compile(r"^\s*(?:[$#>]\s+|`)?")
+_FENCE_LINE = re.compile(r"^\s*```")
+
+
+def _is_command_line(line: str) -> bool:
+    stripped = _CMD_PREFIX.sub("", line).strip().strip("`").strip()
+    if not stripped:
+        return False
+    head = stripped.split()[0]
+    if head.lower() == "sudo" and len(stripped.split()) > 1:
+        head = stripped.split()[1]
+    return head.split("/")[-1].lower() in _COMMAND_HEADS
+
+
+_ASKED_FOR_TEXT = re.compile(
+    r"\b(?:write|draft|compose|generate|show me|give me|print|explain|teach|"
+    r"what(?:'s| is) the command|which command|how do i|how to|how can i|"
+    r"script|snippet|example|sample|template|boilerplate|pseudocode)\b",
+    re.IGNORECASE,
+)
+
+
+def _asked_for_text(user_text: str) -> bool:
+    """Did the user ask FOR a command or script? Then never auto-run what comes back."""
+    return bool(_ASKED_FOR_TEXT.search(user_text or ""))
+
+
+def pasted_commands(text: str, limit: int = 3) -> list[str]:
+    """Commands handed to the user to run, whether bare or inside a fence."""
+    fenced: list[str] = []
+    for block in _CODE_FENCE_BODY.findall(text or ""):
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        if lines and all(_is_command_line(ln) for ln in lines):
+            for line in lines:
+                cleaned = _CMD_PREFIX.sub("", line).strip().strip("`").strip()
+                if cleaned and cleaned not in fenced:
+                    fenced.append(cleaned)
+    if fenced:
+        return fenced[:limit]
+    return bare_commands(text, limit)
+
+
+def bare_commands(text: str, limit: int = 3) -> list[str]:
+    """Commands a reply pasted *instead of* running them.
+
+    Only fires when the message is essentially nothing but commands — a sentence
+    that merely mentions one is left alone.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 1200:
+        return []
+    commands: list[str] = []
+    prose = 0
+    for line in raw.splitlines():
+        if not line.strip() or _FENCE_LINE.match(line):
+            continue
+        if _is_command_line(line):
+            cleaned = _CMD_PREFIX.sub("", line).strip().strip("`").strip().rstrip(".;")
+            if cleaned and cleaned not in commands:
+                commands.append(cleaned)
+        else:
+            prose += 1
+    if not commands or prose > 1:
+        return []
+    return commands[:limit]
 
 _SCAFFOLD_RE = re.compile(
     r"\b(?:npm\s+(?:init|install|create|run)|npx\s+|yarn\s+create|pnpm\s+create|"
@@ -289,6 +370,7 @@ _SCAFFOLD_RE = re.compile(
 )
 
 _CODE_FENCE = re.compile(r"```[\w+-]*\n[\s\S]{20,}?```")
+_CODE_FENCE_BODY = re.compile(r"```[\w+-]*\n([\s\S]*?)```")
 
 _HARDWARE_WORDS = (
     "keyboard",
@@ -562,6 +644,29 @@ def _action_directive(display_text: str, prior: str | None = None) -> str | None
     )
 
 
+_NARRATED_INTENT = re.compile(
+    r"\b(?:i(?:'m| am) (?:going to|about to)|i(?:'ll| will)|let me|allow me to|"
+    r"i shall|one moment while i)\s+"
+    r"(?:just |now |quickly |first )?"
+    r"(?:read|check|run|look|see|get|fetch|grab|take|query|inspect|probe|pull|"
+    r"retrieve|open|launch|start|set|adjust|change|dim|brighten|turn|mute|connect|"
+    r"pair|install|update|scan|search|find|measure|verify|confirm)\b",
+    re.IGNORECASE,
+)
+
+
+def _narrates_intent(text: str) -> bool:
+    """Did the reply promise an action ("I'll check the temperature") without doing it?
+
+    Local models frequently answer with the sentence they should have spoken *while*
+    calling a tool, and then stop. Nothing ran, so the promise is the whole answer.
+    """
+    raw = (text or "").strip()
+    if not raw or len(raw) > 600:
+        return False
+    return bool(_NARRATED_INTENT.search(raw))
+
+
 def _looks_like_instructions(text: str) -> bool:
     """True when the model wrote a how-to instead of calling tools."""
     raw = text or ""
@@ -571,6 +676,8 @@ def _looks_like_instructions(text: str) -> bool:
     if _SHELL_IN_FENCE.search(raw):
         return True
     if len(_SHELL_LINE.findall(raw)) >= 2:
+        return True
+    if bare_commands(raw):
         return True
     if _SCAFFOLD_RE.search(raw):
         return True
@@ -1818,6 +1925,8 @@ class Agent:
                 fast = await self._try_fast_lighting(lighting_text, emit, ctl)
                 if not fast:
                     fast = await self._try_fast_open(display_text, emit, ctl)
+                if not fast:
+                    fast = await self._try_fast_control(display_text, emit, ctl)
             if fast:
                 final_text = fast
             else:
@@ -1909,6 +2018,7 @@ class Agent:
             ctl,
             SUBAGENT_MAX_ITERATIONS,
             mcp_guard=_wants_mcp(goal) and _has_imported_mcp_tools(),
+            action_guard=_wants_action(goal),
             conversation_id=None,
         )
 
@@ -2026,6 +2136,99 @@ class Agent:
         await emit({"type": "assistant", "text": speech})
         return speech
 
+    #: Words that mean "act on that peripheral", which the peripherals tool owns.
+    _PERIPHERAL_SCOPE = {
+        "keyboard": ("keyboard_backlight",),
+        "keypad": ("keyboard_backlight",),
+        "mouse": (),
+        "headset": (),
+        "headphone": (),
+        "headphones": (),
+        "earbuds": (),
+        "controller": (),
+        "printer": ("printer.",),
+        "webcam": ("camera.",),
+    }
+
+    async def _try_fast_control(
+        self,
+        display_text: str,
+        emit: EmitFn,
+        control: RunControl,
+    ) -> str | None:
+        """Run a catalogued device control straight from the request.
+
+        "dim my screen" is not a question; it is an instruction with exactly one
+        sensible execution. Resolving it here means it always runs, instead of
+        depending on the model choosing to call a tool.
+        """
+        from . import controls as ctl
+        from .tools import device_control as dc
+
+        text = (display_text or "").strip()
+        low = text.lower()
+        if not text or low.startswith(("how do i", "how to", "how can i", "how would")):
+            return None
+        res = ctl.resolve(text, fast_only=True)
+        if res is None or res.confidence < 0.8:
+            return None
+        if res.control.risky or res.control.sudo:
+            return None
+        if res.control.reads and not ctl.has_readout(res.control.id):
+            # No way to phrase the output in one sentence — let the model do it.
+            return None
+        for word, allowed in self._PERIPHERAL_SCOPE.items():
+            if re.search(rf"(?<![a-z]){re.escape(word)}(?![a-z])", low):
+                if not any(token in res.control.id for token in allowed):
+                    return None  # belongs to the peripherals tool, not the host
+        try:
+            command = res.render()
+        except ValueError:
+            return None
+
+        self._check(control)
+        call_id = f"call-{uuid.uuid4().hex[:12]}"
+        args = {"action": "control", "control": res.control.id, **res.params}
+        await emit({"type": "say", "text": "At once.", "working": True})
+        await emit({
+            "type": "tool_call",
+            "id": call_id,
+            "name": "device_control",
+            "args": args,
+            "dangerous": False,
+            "auto_approved": True,
+        })
+        await emit({"type": "status", "state": "running_tool"})
+        try:
+            result = await dc._run(args, self.ctx)
+            ok, output = result.ok, result.output
+        except Exception as exc:  # noqa: BLE001
+            ok, output = False, str(exc)
+        await emit({
+            "type": "tool_result",
+            "id": call_id,
+            "name": "device_control",
+            "ok": ok,
+            "output": output,
+        })
+        if ok:
+            speech = ctl.readout(res.control.id, output) if res.control.reads else None
+            if not speech and res.control.reads:
+                # The probe ran but its output did not parse — report it plainly rather
+                # than leaving the call orphaned for the model to repeat.
+                body = output.split("\n(succeeded)\n", 1)[-1]
+                trimmed = " ".join(ln.strip() for ln in body.splitlines() if ln.strip())
+                speech = f"{res.control.summary}: {_speech_excerpt(trimmed, 300)}"
+            if not speech:
+                speech = f"Very good — {ctl.describe(res)}."
+        else:
+            speech = (
+                f"I couldn't manage that — {ctl.describe(res)} failed: "
+                f"{_speech_excerpt(output, 240)}"
+            )
+        await emit({"type": "assistant", "text": speech})
+        return speech
+
     async def _try_fast_open(
         self,
         display_text: str,
@@ -2104,7 +2307,8 @@ class Agent:
         ignore an explicit request to use installed MCP tools — force ``mcp_invoke`` instead.
 
         When ``action_guard`` is set (user asked to *do* something on this machine),
-        refuse how-to dumps and permission-asking replies until tools have actually run.
+        refuse how-to dumps and permission-asking replies until tools have actually run,
+        and run any command the model pasted as its answer instead of speaking it back.
         ``mutation_guard`` additionally refuses to stop after a mere list/inspect —
         a control/shell/open/connect call must happen.
         """
@@ -2118,6 +2322,8 @@ class Agent:
         force_mcp_invoke = False
         mcp_pushes = 0
         provision_pushes = 0
+        command_pushes = 0
+        intent_pushes = 0
         delegation_pushes = 0
         action_pushes = 0
         force_action = False
@@ -2215,6 +2421,26 @@ class Agent:
                     tool_calls = recovered
                     content = ""
 
+            if (
+                not tool_calls
+                and command_pushes < 2
+                and (action_guard or not used_tools)
+                and not _asked_for_text(self._last_user_text)
+            ):
+                # The reply *is* the command ("brightnessctl set 30%", or a fenced
+                # "run this"). Handing back a command the user must run themselves is
+                # the failure this guard exists to stop: run it, through the normal
+                # gates, and let the model answer from real output.
+                pasted = pasted_commands(content)
+                if pasted:
+                    command_pushes += 1
+                    tool_calls = _as_recovered_tool_calls([
+                        ("device_control", {"action": "shell", "command": cmd})
+                        for cmd in pasted
+                    ])
+                    content = ""
+                    await emit({"type": "status", "state": "running_tool"})
+
             if not tool_calls:
                 if content:
                     if mcp_guard and not used_mcp and mcp_pushes < 2:
@@ -2238,6 +2464,30 @@ class Agent:
                             })
                             await emit({"type": "status", "state": "thinking"})
                             continue
+                    if (
+                        intent_pushes < 1
+                        and not used_tools
+                        and _narrates_intent(content)
+                        and not _lacks_capability(content)
+                    ):
+                        # "I'll read your CPU temperature" — and then nothing ran.
+                        # That sentence is working speech, not an answer.
+                        intent_pushes += 1
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[system] You said what you were about to do but called "
+                                "no tool, so nothing happened and the user has no answer. "
+                                "Call the tool now and answer from its output. For "
+                                "anything about this machine, device_control "
+                                "action=control control=<id> performs it — the available "
+                                "ids are listed in your context; device_control "
+                                "action=controls query=<word> searches them."
+                            ),
+                        })
+                        await emit({"type": "status", "state": "thinking"})
+                        continue
                     if (
                         provision_pushes < 1
                         and not used_tools
