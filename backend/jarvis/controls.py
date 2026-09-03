@@ -1223,8 +1223,91 @@ def control_binaries() -> frozenset[str]:
 # ---------------------------------------------------------------------------
 
 
+#: One representative id per everyday intent. The full catalogue is ~200 actions;
+#: dumping all of it into every prompt buries the user's actual request (a small model
+#: then answers *about* the hardware instead of using it). These cover what gets asked
+#: for out loud, and `action=controls query=…` retrieves the rest on demand.
+_ESSENTIAL_IDS: tuple[str, ...] = (
+    "display.brightness.set",
+    "display.brightness.get",
+    "display.keyboard_backlight.set",
+    "display.list",
+    "audio.volume.set",
+    "audio.volume.get",
+    "audio.mute.toggle",
+    "audio.outputs.list",
+    "media.playpause",
+    "media.next",
+    "media.now_playing",
+    "power.battery",
+    "power.lock",
+    "power.uptime",
+    "system.temperature",
+    "system.load",
+    "system.memory",
+    "system.processes.top",
+    "storage.usage",
+    "network.status",
+    "network.wifi.list",
+    "network.wifi.connect",
+    "network.ip.public",
+    "bluetooth.devices",
+    "packages.install",
+    "packages.search",
+    "session.screenshot.full",
+    "session.notify",
+    "session.windows.list",
+    "service.status",
+)
+
+
+def format_controls_index(*, essentials: int = 24) -> str:
+    """A compact index of what this host can do, plus how to look up the rest.
+
+    Deliberately small. The contract with the model is "you have ~200 verified
+    actions here, here are the everyday ids, search for anything else" — which
+    leaves its attention on the request instead of on an inventory.
+    """
+    controls = available()
+    if not controls:
+        return ""
+    grouped = by_category(controls)
+    counts = " · ".join(
+        f"{category} {len(items)}" for category, items in sorted(grouped.items())
+    )
+    by_id = {c.id: c for c in controls}
+    picks = [by_id[cid] for cid in _ESSENTIAL_IDS if cid in by_id][:essentials]
+    lines = [
+        f"=== Device controls: {len(controls)} verified actions on this machine ===",
+        "Perform one with device_control action=control, passing control= one of the ids "
+        "below verbatim (and value= where the signature shows one). The id is the "
+        "contract — the command, backend and OS quirks are already resolved for this "
+        "host, so never compose or print shell syntax for anything in this catalogue, "
+        "and never pass a placeholder in place of an id.",
+        f"Categories: {counts}",
+    ]
+    if picks:
+        lines.append("Everyday ids:")
+        for control in picks:
+            lines.append(f"  {control.signature()} — {control.summary}")
+    lines.append(
+        "That is a shortlist, not the limit. For anything else — and before concluding "
+        "you cannot do something to this machine — call device_control "
+        "action=controls query=<word> (e.g. query=bluetooth, query=nightlight) and it "
+        "returns the matching ids; then perform one."
+    )
+    gaps = installable()
+    if gaps:
+        lines.append(
+            "Missing a capability? These packages unlock more, and you may install them "
+            "yourself with control=packages.install value=<pkg>: "
+            + ", ".join(g["package"] for g in gaps[:8])
+        )
+    return "\n".join(lines)
+
+
 def format_controls_context(*, max_per_category: int = 40) -> str:
-    """The exhaustive command list, injected into the system prompt."""
+    """The exhaustive command list. Opt-in via config.agent.full_device_context."""
     controls = available()
     if not controls:
         return ""
@@ -1232,7 +1315,8 @@ def format_controls_context(*, max_per_category: int = 40) -> str:
     lines = [
         "=== Device controls available on this machine "
         f"({len(controls)} verified actions) ===",
-        "Run any of these with device_control action=control control=<id> value=<v>. "
+        "Run any of these with device_control action=control, passing control= the id "
+        "verbatim and value= where the signature shows one. "
         "The id is the contract; JARVIS already resolved the right backend command for "
         "this OS, session, and installed tools. Never print these commands as chat — "
         "call the tool.",
@@ -1273,8 +1357,9 @@ def format_control_memories(hostname: str) -> list[str]:
         )
         out.append(
             f"{category} controls on {hostname} ({len(actions)} actions): {summaries}. "
-            f"Perform any of them with device_control action=control control=<id> "
-            f"value=<v>; list them with device_control action=controls query={category.lower()}."
+            f"Perform any of them with device_control action=control and the id "
+            f"verbatim; list them with device_control action=controls "
+            f"query={category.lower()}."
         )
     return out
 

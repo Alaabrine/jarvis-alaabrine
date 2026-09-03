@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -51,6 +52,23 @@ class LLMConfig:
     embedding_model: str = field(default_factory=lambda: _env("JARVIS_EMBEDDING_MODEL"))
 
     temperature: float = 0.6
+
+    @property
+    def active_base_url(self) -> str:
+        if self.prefer == "cloud" and self.fallback_base_url:
+            return self.fallback_base_url
+        return self.base_url or self.fallback_base_url
+
+    @property
+    def is_local(self) -> bool:
+        """True when requests go to a model on this machine (or the LAN)."""
+        url = self.active_base_url.lower()
+        if not url:
+            return False
+        return any(
+            host in url
+            for host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", ".local", "host.docker.internal")
+        ) or bool(re.search(r"//(?:10|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.", url))
 
 
 @dataclass
@@ -110,6 +128,20 @@ class PermissionsConfig:
     sudo_password: str = field(default_factory=lambda: _env("JARVIS_SUDO_PASSWORD"))
 
 
+def _normalise_strict_tools(value: object) -> str:
+    """Accept "auto"/"on"/"off" and the booleans older configs and UIs send."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    text = str(value or "").strip().lower()
+    if text in {"auto", "on", "off"}:
+        return text
+    if text in {"1", "true", "yes"}:
+        return "on"
+    if text in {"0", "false", "no"}:
+        return "off"
+    return "auto"
+
+
 @dataclass
 class AgentConfig:
     """How much scaffolding the agent wraps around the model.
@@ -125,9 +157,24 @@ class AgentConfig:
     """
 
     trust_model: bool = field(default_factory=lambda: _env_bool("JARVIS_AGENT_TRUST_MODEL", True))
-    strict_tools: bool = field(default_factory=lambda: _env_bool("JARVIS_AGENT_STRICT_TOOLS", False))
+    #: "auto" (default) enables recovery only when the active endpoint is a local model;
+    #: "on" / "off" force it. Measured on qwen3.5 through Ollama: with a system prompt of
+    #: any realistic size it names the right tool and arguments but writes them as chat
+    #: text instead of emitting a tool call, so on local endpoints recovery is the
+    #: difference between acting and narrating. Cloud models emit calls properly and
+    #: get no recovery layer.
+    strict_tools: str = field(
+        default_factory=lambda: _env("JARVIS_AGENT_STRICT_TOOLS", default="auto")
+    )
     max_iterations: int = field(
         default_factory=lambda: int(_env("JARVIS_AGENT_MAX_ITERATIONS", default="24"))
+    )
+    # Inject the exhaustive device/app/peripheral listings into every system prompt
+    # instead of a compact searchable index. The full dump is ~6k tokens and measurably
+    # drowns short requests: small models answer *about* the inventory rather than
+    # using it. Tools retrieve the detail on demand either way.
+    full_device_context: bool = field(
+        default_factory=lambda: _env_bool("JARVIS_FULL_DEVICE_CONTEXT", False)
     )
     # Store a summary of every turn as a semantically recallable memory. Off by
     # default: task-specific chatter recalled into a new conversation makes JARVIS
@@ -135,6 +182,17 @@ class AgentConfig:
     store_conversation_memories: bool = field(
         default_factory=lambda: _env_bool("JARVIS_STORE_CONVERSATION_MEMORIES", False)
     )
+
+    def __post_init__(self) -> None:
+        self.strict_tools = _normalise_strict_tools(self.strict_tools)
+
+    def recover_narrated_calls(self, llm: "LLMConfig") -> bool:
+        """Should the loop parse tool calls a model wrote as text?"""
+        if self.strict_tools == "on":
+            return True
+        if self.strict_tools == "off":
+            return False
+        return llm.is_local
 
 
 @dataclass
@@ -343,7 +401,13 @@ class ConfigStore:
             elif key == "agent" and isinstance(value, dict):
                 for k, v in value.items():
                     if hasattr(cfg.agent, k):
-                        if k in {"trust_model", "strict_tools", "store_conversation_memories"}:
+                        if k == "strict_tools":
+                            setattr(cfg.agent, k, _normalise_strict_tools(v))
+                        elif k in {
+                            "trust_model",
+                            "store_conversation_memories",
+                            "full_device_context",
+                        }:
                             setattr(cfg.agent, k, bool(v))
                         elif k == "max_iterations":
                             setattr(cfg.agent, k, max(1, int(v)))

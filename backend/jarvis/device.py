@@ -294,8 +294,23 @@ def profile_summary(profile: dict[str, Any]) -> str:
     )
 
 
-def format_device_context(profile: dict[str, Any]) -> str:
-    """Format the device profile for injection into the system prompt."""
+def _full_context_enabled() -> bool:
+    try:
+        from .config import store
+
+        return bool(store.get().agent.full_device_context)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def format_device_context(profile: dict[str, Any], *, full: bool | None = None) -> str:
+    """Format the device profile for injection into the system prompt.
+
+    By default the control and application catalogues are summarised into searchable
+    indexes rather than listed in full — see ``config.agent.full_device_context``.
+    """
+    if full is None:
+        full = _full_context_enabled()
     lines = [
         "=== This device (learned autonomously) ===",
         f"Hostname: {profile['hostname']}",
@@ -316,7 +331,11 @@ def format_device_context(profile: dict[str, Any]) -> str:
 
     if profile.get("battery"):
         b = profile["battery"]
-        lines.append(f"Battery: {b.get('percent')}% {'(plugged in)' if b.get('plugged') else '(on battery)'}")
+        try:
+            pct = f"{float(b.get('percent') or 0):.0f}"
+        except (TypeError, ValueError):
+            pct = str(b.get("percent"))
+        lines.append(f"Battery: {pct}% {'(plugged in)' if b.get('plugged') else '(on battery)'}")
 
     lines.append("Disks:")
     for d in profile.get("disks") or []:
@@ -339,12 +358,16 @@ def format_device_context(profile: dict[str, Any]) -> str:
         for h in hints:
             lines.append(f"  • {h}")
 
-    controls_ctx = _controls.format_controls_context()
+    controls_ctx = (
+        _controls.format_controls_context()
+        if full
+        else _controls.format_controls_index()
+    )
     if controls_ctx:
         lines.append("")
         lines.append(controls_ctx)
 
-    gaps = profile.get("controls_installable") or _controls.installable()
+    gaps = (profile.get("controls_installable") or _controls.installable()) if full else []
     if gaps:
         lines.append(
             "\nControls this device could gain — install the package yourself with "
@@ -356,7 +379,7 @@ def format_device_context(profile: dict[str, Any]) -> str:
                 f"  • {gap['package']} → {gap['unlocks']}"
             )
 
-    app_ctx = _catalog().context()
+    app_ctx = _catalog().context(full=full)
     if app_ctx:
         lines.append("")
         lines.append(app_ctx)

@@ -2010,6 +2010,55 @@ def inspect_peripheral(p: dict[str, Any]) -> dict[str, Any]:
     return {"facts": facts, "extra": extra}
 
 
+def format_inventory_index(peripherals: list[dict[str, Any]]) -> str:
+    """Connected hardware plus counts — not the whole scan.
+
+    Offline USB ids and per-device shell hints belong in a tool result, not in every
+    prompt: the model only needs to know what is attached and that the peripherals
+    tool acts on it by name.
+    """
+    if not peripherals:
+        return (
+            "=== Peripherals ===\nNone inventoried yet. peripherals action=scan finds them."
+        )
+    live = [p for p in peripherals if p.get("connected")]
+    # Nearby Wi-Fi networks are scan results, not attached hardware: 20-odd SSIDs in
+    # the prompt is noise the model starts narrating. The count and a scan suffice.
+    present = [
+        p
+        for p in peripherals
+        if p.get("available", True)
+        and not p.get("connected")
+        and (p.get("kind") or "") != "wifi"
+    ]
+    counts: dict[str, int] = {}
+    for p in peripherals:
+        counts[p.get("kind") or "other"] = counts.get(p.get("kind") or "other", 0) + 1
+    lines = [
+        f"=== Peripherals: {len(live)} connected, {len(present)} more present ===",
+        "The peripherals tool lists, scans, inspects, connects, pairs and controls these "
+        "by name — action=connect target=<name> does discovery, pairing and audio routing "
+        "in one call. Keyboard RGB/backlight: action=control command=lighting "
+        "value=rainbow|spectrum|off|50%.",
+        "Inventory: " + " · ".join(f"{k} {v}" for k, v in sorted(counts.items())),
+    ]
+    if live:
+        lines.append("Connected now:")
+        for p in live[:12]:
+            lines.append(f"  {p.get('name')} [{p.get('kind')}]")
+    if present:
+        lines.append(
+            "Also present: "
+            + ", ".join(str(p.get("name")) for p in present[:10])
+            + (f" (+{len(present) - 10} more)" if len(present) > 10 else "")
+        )
+    lines.append(
+        "peripherals action=list (optionally kind=<kind>) returns the full inventory with "
+        "ids and addresses when you need one."
+    )
+    return "\n".join(lines)
+
+
 def format_inventory(peripherals: list[dict[str, Any]], *, limit: int = 48) -> str:
     if not peripherals:
         return "=== Peripherals ===\nNone detected yet. Use the peripherals tool (action=scan) to search."
@@ -2103,12 +2152,15 @@ class PeripheralLearner:
         return list(self._items)
 
     def get_context(self) -> str:
-        if self._items:
-            return format_inventory(self._items)
-        stored = self.memory.list_peripherals()
-        if stored:
-            return format_inventory(stored)
-        return ""
+        try:
+            from .config import store as _store
+
+            full = bool(_store.get().agent.full_device_context)
+        except Exception:  # noqa: BLE001
+            full = False
+        render = format_inventory if full else format_inventory_index
+        items = self._items or self.memory.list_peripherals()
+        return render(items) if items else ""
 
     def resolve(self, target: str) -> dict[str, Any] | None:
         needle = (target or "").strip().lower()

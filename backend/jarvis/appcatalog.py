@@ -663,8 +663,38 @@ def _context_rank(app: AppEntry) -> tuple:
     )
 
 
+def format_apps_index(apps: list[AppEntry], *, examples: int = 10) -> str:
+    """One line: how many applications exist and which call finds the right one.
+
+    Listing them is actively harmful. With ~120 apps and their purposes in the prompt —
+    browsers among them — qwen3.5 answered "what's the weather in Casablanca?" by
+    launching Firefox, and "who won the last F1 race?" with "I'll check using your
+    installed applications". Removing the listing took web questions from 0/6 to 4/6 on
+    the same prompt. ``action=apps query=<purpose>`` resolves the catalogue on demand,
+    including the names that give no clue ("Vinegar" is Roblox Studio), and
+    ``action=open app=<purpose>`` resolves against it directly.
+    """
+    if not apps:
+        return ""
+    gui = sum(1 for a in apps if a.gui)
+    return (
+        f"=== Installed applications: {len(apps)} entries ({gui} GUI), not listed here ===\n"
+        "For a task an application would do, call device_control action=apps "
+        "query=<purpose> to see what is installed (it knows what each one is FOR, "
+        "including names that give no clue), then action=open app=<name, id or purpose> "
+        "to launch it and carry on with the task inside it. Do not open a browser or an "
+        "application to look something up — the browse tool reads the web directly."
+    )
+
+
+def _name_implies_purpose(app: AppEntry) -> bool:
+    """True when the app's own name already contains one of its purpose words."""
+    name = (app.name or "").lower()
+    return any(alias.split()[0] in name for alias in app.aliases if alias.strip())
+
+
 def format_apps_context(apps: list[AppEntry], *, gui_limit: int = 55, cli_limit: int = 40) -> str:
-    """Compact prompt block so the agent knows what is installed without asking."""
+    """The exhaustive listing. Opt-in via config.agent.full_device_context."""
     if not apps:
         return ""
     gui = sorted((a for a in apps if a.gui), key=_context_rank)
@@ -768,8 +798,9 @@ class AppCatalog:
         hits = self.resolve(query, limit=1)
         return hits[0][0] if hits and hits[0][1] >= 20.0 else None
 
-    def context(self) -> str:
-        return format_apps_context(self.apps())
+    def context(self, *, full: bool = False) -> str:
+        apps = self.apps()
+        return format_apps_context(apps) if full else format_apps_index(apps)
 
     def summary(self) -> str:
         apps = self.apps()
