@@ -566,7 +566,7 @@ class Memory:
                     continue
                 boost = 0.05 if kind in _DURABLE_KINDS else 0.0
                 text = (r["text"] or "").strip()
-                if not text:
+                if not text or is_self_belief(text):
                     continue
                 key = text[:160].lower()
                 if key in seen:
@@ -585,7 +585,7 @@ class Memory:
         seen_kw: set[str] = set()
         for r in rows:
             text = (r["text"] or "").strip()
-            if not text:
+            if not text or is_self_belief(text):
                 continue
             low = text.lower()
             kind = (r["kind"] or "").strip()
@@ -611,6 +611,65 @@ class Memory:
 #: Session-scoped notes: chat transcripts and REM staging. Never recalled across
 #: conversations — see ``Memory.recall``. Still visible in the memory bank UI.
 _EPISODIC_KINDS = frozenset({"conversation", "staged", "short_term"})
+
+#: Notes describing what JARVIS can or cannot do. These are never facts about the user
+#: or the machine — they are a past reply's own hedging, consolidated into memory by REM
+#: ("…despite browsing limitations"). Recalling one teaches the model that the limitation
+#: is real, so it declines the capability again and the belief sustains itself.
+#:
+#: Matching is deliberately conservative: an unmistakable phrase about tooling, or a
+#: denial of capability whose subject is the assistant. "The user cannot drive" and
+#: "the printer has no network access" are facts and must survive.
+_ASSISTANT_LIMIT_RE = re.compile(
+    r"\b(?:"
+    r"brows(?:ing|er)\s+(?:capabilit|limitation|restriction|constraint|issue)\w*|"
+    r"limited\s+brows\w*|brows\w*\s+(?:is|are|may be)\s+limited|"
+    r"knowledge\s+cut[- ]?off|"
+    r"(?:no|without)\s+(?:live|real[- ]time)\s+(?:access|data|information)|"
+    r"(?:cannot|can't|unable to)\s+(?:access|fetch|retrieve|browse|search)\s+"
+    r"(?:the\s+)?(?:live|real[- ]time|current|internet|web)"
+    r")\b",
+    re.IGNORECASE,
+)
+#: A denial of capability — only counts as a self-belief with a self-subject nearby.
+_DENIAL_RE = re.compile(
+    r"\b(?:cannot|can't|can not|unable to|not able to|no ability to|lacks?|lacking|"
+    r"does not have|doesn't have|do not have|don't have|no access to)\b",
+    re.IGNORECASE,
+)
+_SELF_SUBJECT_RE = re.compile(
+    r"(?:^|\b)(?:i|i'm|im|my|me|you|your|jarvis|jarvis's|the assistant|assistant|"
+    r"the model|the agent)\b",
+    re.IGNORECASE,
+)
+#: The capability being denied, when a self-subject denies one.
+_CAPABILITY_RE = re.compile(
+    r"\b(?:brows\w*|internet|web|online|search\w*|real[- ]time|live data|"
+    r"current (?:events|information|data|news)|tool|tools|integration|api)\b",
+    re.IGNORECASE,
+)
+
+
+def is_self_belief(text: str) -> bool:
+    """True when a note records JARVIS's own (in)capabilities rather than a real fact.
+
+    Such a note is an artefact of one hedged reply. Kept in memory it becomes a
+    self-fulfilling limitation, so it is excluded from recall and from REM promotion.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _ASSISTANT_LIMIT_RE.search(raw):
+        return True
+    return bool(
+        _DENIAL_RE.search(raw)
+        and _SELF_SUBJECT_RE.search(raw)
+        and _CAPABILITY_RE.search(raw)
+    )
+
+
+#: Kinds that outlive their conversation. Given a small relevance boost so a standing
+#: fact wins over an incidental note.
 _DURABLE_KINDS = frozenset(
     {"long_term", "device", "peripheral", "device_control", "preference", "fact"}
 )

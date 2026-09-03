@@ -22,7 +22,7 @@ from typing import Any, Callable
 
 from .config import DATA_DIR, store
 from .llm import LLMClient, LLMError
-from .memory import Memory
+from .memory import Memory, is_self_belief
 
 log = logging.getLogger("jarvis.rem")
 
@@ -298,7 +298,7 @@ class RemSleepService:
         seen: set[str] = set()
         for row in rows:
             text = (row.get("text") or "").strip()
-            if len(text) < 24:
+            if len(text) < 24 or is_self_belief(text):
                 continue
             key = text[:120].lower()
             if key in seen:
@@ -347,6 +347,10 @@ class RemSleepService:
             "task brief makes JARVIS act on a request nobody made.\n"
             "Write each item as a fact ('prefers Firefox', 'keyboard backlight is ASUS "
             "Aura'), never as an imperative.\n"
+            "Never write anything about what JARVIS itself can or cannot do — no notes "
+            "about browsing limits, missing access, or unavailable tools. Those come from "
+            "a reply hedging about itself, not from the user, and storing one makes it "
+            "permanent.\n"
             "Return ONLY a JSON array of short strings. No markdown.\n\n"
             f"Notes:\n{corpus}"
         )
@@ -502,5 +506,9 @@ def _is_ephemeral_memory_line(text: str) -> bool:
     if low.startswith("user asked:") or low.startswith("user interest:"):
         return True
     if re.match(r"^(open|launch|go to|visit)\b", low):
+        return True
+    # A reply that hedged about its own abilities is not a fact to keep. Promoting one
+    # makes the hedge permanent: it comes back as context and the next reply repeats it.
+    if is_self_belief(low):
         return True
     return False
