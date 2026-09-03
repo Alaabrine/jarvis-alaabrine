@@ -429,6 +429,36 @@ You ──▶ Web/Desktop UI ──WebSocket──▶ Agent loop ──▶ LLM (
 
 On startup JARVIS autonomously profiles the host (CPU, RAM, disks, desktop environment, package managers, audio/display/network utilities) and scans for peripherals (USB, Bluetooth, audio sinks, displays, cameras, printers, storage, Wi-Fi, mDNS). Control hints are injected into every conversation. Ask it to dim the screen, connect headphones, join Wi-Fi, install a package, or open an app — it picks the right tool from what it already knows. Use `remember` (or `peripherals remember`) to persist newly discovered control methods.
 
+### The agent loop
+
+The loop is a thin executor, not a second decision-maker: it sends the conversation plus
+the tool schemas to the model, runs whatever tool calls come back (pausing on the
+irreversible ones), appends the results, and repeats until the model answers in plain
+text. Which tool to reach for, and when the job is done, is the model's call — steered by
+the system prompt, not by heuristics in the loop.
+
+```bash
+export JARVIS_AGENT_TRUST_MODEL=true    # default; the model's reply ends the turn
+export JARVIS_AGENT_STRICT_TOOLS=false  # default; see below
+export JARVIS_AGENT_MAX_ITERATIONS=24   # tool rounds before a forced wrap-up
+```
+
+Weak local models sometimes *describe* a tool call instead of emitting one, or hand back
+a shell command as the chat reply. `JARVIS_AGENT_STRICT_TOOLS=true` (or
+`{"agent": {"strict_tools": true}}` in `~/.jarvis/config.json`) parses those back into
+real calls and runs them through the normal approval gates.
+`JARVIS_AGENT_TRUST_MODEL=false` additionally retries once when a reply arrives
+completely empty. Leave both at their defaults for cloud models.
+
+### Memory across sessions
+
+A new conversation starts clean. Only durable notes — preferences, device facts, control
+methods, REM-consolidated themes — are recalled into it, and they arrive labelled as
+background facts rather than instructions, so an unfinished request from yesterday's chat
+does not become today's task. Per-turn chat summaries are not stored as recallable
+memories by default (`JARVIS_STORE_CONVERSATION_MEMORIES=true` restores that); use
+`remember` for anything that should genuinely outlive the conversation.
+
 The agent streams every step (reasoning, tool calls, results) to the Activity Monitor.
 Chat and activity are saved per session (delete a session or Clear the monitor independently).
 After configurable idle time, REM sleep runs light → REM → deep consolidation into

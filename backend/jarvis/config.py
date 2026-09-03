@@ -111,6 +111,33 @@ class PermissionsConfig:
 
 
 @dataclass
+class AgentConfig:
+    """How much scaffolding the agent wraps around the model.
+
+    ``trust_model`` keeps the executor thin: send messages plus tool schemas, run the
+    tool calls that come back, and let the model's own text end the turn. Turning it
+    off adds one bounded retry when a reply arrives with no tool calls at all — a
+    crutch for weak local models, not a default.
+
+    ``strict_tools`` re-enables the recovery paths those models need: parsing a
+    narrated tool call out of prose, and running a command the model pasted into the
+    chat instead of calling a tool. Off for cloud models, on for weak local ones.
+    """
+
+    trust_model: bool = field(default_factory=lambda: _env_bool("JARVIS_AGENT_TRUST_MODEL", True))
+    strict_tools: bool = field(default_factory=lambda: _env_bool("JARVIS_AGENT_STRICT_TOOLS", False))
+    max_iterations: int = field(
+        default_factory=lambda: int(_env("JARVIS_AGENT_MAX_ITERATIONS", default="24"))
+    )
+    # Store a summary of every turn as a semantically recallable memory. Off by
+    # default: task-specific chatter recalled into a new conversation makes JARVIS
+    # resume work nobody asked for. Durable facts go through the remember tool.
+    store_conversation_memories: bool = field(
+        default_factory=lambda: _env_bool("JARVIS_STORE_CONVERSATION_MEMORIES", False)
+    )
+
+
+@dataclass
 class DeviceConfig:
     """Autonomous device / peripheral learning — profile the host and attached hardware."""
 
@@ -236,6 +263,7 @@ class Config:
     searxng_url: str = field(default_factory=lambda: _env("JARVIS_SEARXNG_URL"))
     user_name: str = field(default_factory=lambda: _env("JARVIS_USER_NAME", default="Sir"))
     llm: LLMConfig = field(default_factory=LLMConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
     email_accounts: EmailAccounts = field(default_factory=_default_email_accounts)
     permissions: PermissionsConfig = field(default_factory=PermissionsConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
@@ -312,6 +340,15 @@ class ConfigStore:
                             setattr(cfg.permissions, k, bool(v))
                         else:
                             setattr(cfg.permissions, k, v)
+            elif key == "agent" and isinstance(value, dict):
+                for k, v in value.items():
+                    if hasattr(cfg.agent, k):
+                        if k in {"trust_model", "strict_tools", "store_conversation_memories"}:
+                            setattr(cfg.agent, k, bool(v))
+                        elif k == "max_iterations":
+                            setattr(cfg.agent, k, max(1, int(v)))
+                        else:
+                            setattr(cfg.agent, k, v)
             elif key == "device" and isinstance(value, dict):
                 for k, v in value.items():
                     if hasattr(cfg.device, k):
