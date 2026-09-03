@@ -78,9 +78,17 @@ matching to fix a bad reply — improve the tool schema/description or the syste
 
 Two opt-in crutches for weak local models live in `config.agent`, both default-off:
 
-- `strict_tools` — recover a tool call the model narrated as prose, and run a command it
-  pasted as its reply, both through the normal approval gates. All of this lives below the
-  `Strict-tools recovery` banner in `agent.py`.
+- `strict_tools` (`"auto"` | `"on"` | `"off"`, default `auto`) — recover a tool call the
+  model narrated as prose, and run a command it pasted as its reply, both through the
+  normal approval gates. `auto` resolves via `AgentConfig.recover_narrated_calls()` to on
+  for a local endpoint (`LLMConfig.is_local`) and off for a cloud one. This is not
+  optional polish for local models: qwen3.5 through Ollama picks the right tool and
+  arguments and then writes them as chat text at any realistic prompt size — it only
+  emits structured calls when the system prompt is trivially short. All the parsing lives
+  below the `Strict-tools recovery` banner in `agent.py`, and the argument names come from
+  the live tool schemas (`_tool_param_keys`), because a hardcoded list silently dropped
+  `control=…` — the one argument that mattered. `RecoveryParsingTests` pins real
+  transcripts.
 - `trust_model=false` — one retry when a reply comes back completely empty.
 
 Kept unconditionally because they are not judgement about the request: barge-in/cancel
@@ -119,7 +127,17 @@ comes from `_hard_gate_risk`.
 `_build_messages` injects two context blocks into every system prompt:
 `DeviceLearner.get_context()` and `PeripheralLearner.get_context()`. The first is
 assembled by `device.format_device_context()`, which stitches together three sources —
-follow that function to see what the model actually knows:
+follow that function to see what the model actually knows.
+
+**These are indexes, not listings, and that is load-bearing.** Each source has a
+`format_*_index` (compact) and a `format_*_context` / `format_inventory` (exhaustive)
+form; `config.agent.full_device_context` picks between them and defaults to the index.
+The full dump is ~6k tokens before the user's message and demonstrably hijacks short
+requests — asked for a news briefing, qwen3.5 answered with a hardware status report and
+made no tool call. Every index therefore ends by naming the tool call that retrieves the
+detail (`action=controls query=…`, `action=apps query=…`, `peripherals action=list`). If
+you add to any of these blocks, add it to the exhaustive form, not the index.
+
 
 - **`device.py`** — the host profile it scans (CPU, RAM, disks, desktop/session, init
   system, package managers, installed tools) and control hints.
@@ -159,6 +177,14 @@ One SQLite DB (`~/.jarvis/jarvis.db`): `conversations`, `messages`, `activity_it
 Per-turn summaries are not stored as recallable memories unless
 `config.agent.store_conversation_memories` is on. The `remember` tool is the durable path
 and its description exists to keep task briefs out of it.
+
+`memory.is_self_belief()` filters a third category out of recall entirely, whatever kind
+it was stored under: notes about what JARVIS itself can or cannot do. REM had promoted
+"…despite browsing limitations" to `long_term`, where it was recalled into later turns
+and taught the model that the limitation was real — which produced the next hedge, and
+the next note. The filter is intentionally narrow (an unmistakable tooling phrase, or a
+capability denial whose subject is the assistant) so that real facts like "the printer
+has no network access" survive; `SelfBeliefTests` pins both directions.
 
 **`rem.py`** — after idle time (`config.rem`), a light → REM → deep sweep stages recent
 signals, extracts themes via the LLM, and promotes durable ones into `long_term` plus

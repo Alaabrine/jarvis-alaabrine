@@ -438,17 +438,36 @@ text. Which tool to reach for, and when the job is done, is the model's call —
 the system prompt, not by heuristics in the loop.
 
 ```bash
-export JARVIS_AGENT_TRUST_MODEL=true    # default; the model's reply ends the turn
-export JARVIS_AGENT_STRICT_TOOLS=false  # default; see below
-export JARVIS_AGENT_MAX_ITERATIONS=24   # tool rounds before a forced wrap-up
+export JARVIS_AGENT_TRUST_MODEL=true      # default; the model's reply ends the turn
+export JARVIS_AGENT_STRICT_TOOLS=auto     # auto | on | off — see below
+export JARVIS_AGENT_MAX_ITERATIONS=24     # tool rounds before a forced wrap-up
+export JARVIS_FULL_DEVICE_CONTEXT=false   # default; see "What the model is told" below
 ```
 
-Weak local models sometimes *describe* a tool call instead of emitting one, or hand back
-a shell command as the chat reply. `JARVIS_AGENT_STRICT_TOOLS=true` (or
-`{"agent": {"strict_tools": true}}` in `~/.jarvis/config.json`) parses those back into
-real calls and runs them through the normal approval gates.
-`JARVIS_AGENT_TRUST_MODEL=false` additionally retries once when a reply arrives
-completely empty. Leave both at their defaults for cloud models.
+Local models reliably choose the *right* tool and arguments and then write them into the
+chat as text instead of emitting a tool call — measured on qwen3.5 through Ollama, which
+replies `device_control action=control control=power.battery` as prose at any realistic
+system-prompt size, and only emits real calls when the prompt is trivially short.
+`strict_tools` parses those back into genuine calls (and runs a command handed back as
+the reply), through the same approval gates as any other call.
+
+`auto`, the default, turns that on when the configured endpoint is a local one
+(localhost, a LAN address, `*.local`) and off for a cloud API, which needs no such help.
+`on` / `off` force it either way. `JARVIS_AGENT_TRUST_MODEL=false` additionally retries
+once when a reply arrives completely empty — for models that stall rather than answer.
+
+### What the model is told
+
+The device, control, application and peripheral catalogues are injected into every
+system prompt as a **searchable index** — counts per category, the everyday control ids,
+the connected hardware, and the tool calls that retrieve the rest
+(`device_control action=controls query=…`, `action=apps query=…`, `peripherals action=list`).
+
+This is a deliberate budget, not a shortcut. The exhaustive listing is ~6k tokens ahead
+of the user's message, and it measurably changes the answer: asked for a news briefing
+with the full dump in context, qwen3.5 replied with a webcam and Wi-Fi status report and
+called no tools at all; with the index it searches the web. Set
+`JARVIS_FULL_DEVICE_CONTEXT=true` to restore the complete listing.
 
 ### Memory across sessions
 
@@ -458,6 +477,11 @@ background facts rather than instructions, so an unfinished request from yesterd
 does not become today's task. Per-turn chat summaries are not stored as recallable
 memories by default (`JARVIS_STORE_CONVERSATION_MEMORIES=true` restores that); use
 `remember` for anything that should genuinely outlive the conversation.
+
+Notes about JARVIS's *own* abilities are never stored or recalled. A reply that hedged
+("…despite browsing limitations") used to be consolidated by REM into a permanent fact,
+come back as context, and teach the next reply to hedge again — a limitation that
+invented itself and then persisted.
 
 The agent streams every step (reasoning, tool calls, results) to the Activity Monitor.
 Chat and activity are saved per session (delete a session or Clear the monitor independently).
