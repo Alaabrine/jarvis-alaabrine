@@ -45,17 +45,28 @@ def _looks_complete_json(raw: str) -> bool:
 
 
 def split_thinking(text: str) -> tuple[str, str]:
-    """Split model output into (reasoning, visible_content)."""
+    """Split model output into (reasoning, visible_content).
+
+    Handles three shapes: a matched ``<think>…</think>`` pair, an unterminated
+    ``<think>`` (the stream ended mid-thought), and a bare closing ``</think>`` with no
+    opening tag — which is what the Qwen3 chat template produces, since it opens the
+    block itself and only the completion comes back. Without that last case the whole
+    chain of thought, closing tag and all, is spoken to the user as the answer.
+    """
     if not text:
         return "", ""
     parts = _THINK_RE.findall(text)
     visible = _THINK_RE.sub("", text).strip()
-    lower = text.lower()
+    lower = visible.lower()
     if "<think>" in lower and "</think>" not in lower:
         idx = lower.find("<think>")
-        body = text[idx + len("<think>") :]
-        parts = list(parts) + [body]
-        visible = text[:idx].strip()
+        parts = list(parts) + [visible[idx + len("<think>") :]]
+        visible = visible[:idx].strip()
+    elif "</think>" in lower and "<think>" not in lower:
+        # Template-opened block: everything up to the close was thinking.
+        idx = lower.find("</think>")
+        parts = list(parts) + [visible[:idx]]
+        visible = visible[idx + len("</think>") :].strip()
     reasoning = "\n\n".join(p.strip() for p in parts if p.strip())
     return reasoning, visible
 

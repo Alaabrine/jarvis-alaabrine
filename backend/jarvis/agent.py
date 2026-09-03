@@ -8,8 +8,9 @@ system prompt, not to pattern matching here.
 
 Two escape hatches exist for weak local models, both off by default and both in
 ``config.agent``: ``strict_tools`` recovers tool calls a model narrated as prose (and
-runs a command it pasted instead of calling a tool), and ``trust_model=False`` adds one
-bounded retry when a reply arrives with no tool calls at all.
+runs a command it pasted instead of calling a tool) — on by default for local endpoints,
+which measurably need it — and ``trust_model=False`` adds one bounded retry when a reply
+arrives with no tool calls at all.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from .device import get_learner
 from .peripherals import get_learner as get_peripheral_learner
 from .llm import Interrupted, LLMClient, LLMError
 from .memory import Memory
-from .persona import system_prompt
+from .persona import reach_context, system_prompt
 from .tools import ToolContext, openai_schemas, registry
 
 EmitFn = Callable[[dict[str, Any]], Awaitable[None]]
@@ -108,6 +109,15 @@ def _dedupe_suggestions(items: list[dict[str, str]]) -> list[dict[str, str]]:
     return out
 
 
+def _imported_mcp_tool_count() -> int:
+    try:
+        from .mcp_client import get_manager
+
+        return len(get_manager().proxy_tools())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def _config_miss_kind(output: str) -> str | None:
     """A tool blocked on a setting the user can supply — offer the shortcut."""
     low = (output or "").lower()
@@ -143,8 +153,12 @@ def _hard_gate_risk(name: str, args: dict, preview: str) -> str:
 
 _SYSTEM_ECHO = re.compile(
     r"(do not mention these system instructions|stop working now|"
-    r"\[system\]|these system instructions)",
-    re.I,
+    r"\[system\]|these system instructions|"
+    # Local models sometimes emit their scratchpad as the answer, quoting our own
+    # asides back as numbered "constraints".
+    r"^\s*thinking process|^\s*constraint\s*\d|"
+    r"^\s*(?:\d+[.)]\s*)?\*{0,2}analy[sz]e(?:\s+the)?\s+(?:request|prompt|task))",
+    re.I | re.M,
 )
 
 
@@ -241,18 +255,18 @@ _FUNC_TOOL_RE = re.compile(
     r"x|y|keys|key|mode|value)\s*=[^)]{1,400})\)",
     re.I,
 )
-# Prose form: ``device_control action=open url=https://…`` (no brackets/parens).
+# Prose form: ``device_control action=open url=https://…`` (no brackets/parens). The
+# argument names are not enumerated here — they come from the tool schemas, so a tool
+# gaining a parameter does not silently become unparseable.
 _PROSE_TOOL_RE = re.compile(
-    r"(?m)^(?:let me (?:just )?|i(?:'| a)?m going to |i(?:'| wi)ll |"
+    # Leading noise a model puts in front of the call: list bullets, quote markers, a
+    # code fence opened on the same line (```browse url=…), a bracket ([device_control
+    # action=control …]), or a spoken lead-in. All observed in real transcripts.
+    r"(?m)^[ \t]*(?:`{1,3}|[-*>\[]|\d+[.)])*[ \t]*"
+    r"(?:let me (?:just )?|i(?:'| a)?m going to |i(?:'| wi)ll |"
     r"calling |use |using |run |running |execute |executing )?"
-    r"([a-zA-Z_][\w]*)\s+"
-    r"((?:action|url|app|target|command|path|query|text|keys|key|mode|value|"
-    r"x|y)\s*=\S+(?:\s+(?:action|url|app|target|command|path|query|text|keys|"
-    r"key|mode|value|x|y)\s*=\S+)*)",
+    r"([a-zA-Z_][\w]*)\s+([^\n]*?=[^\n]*?)[ \t]*(?:`{1,3}|\])?[ \t]*$",
     re.I,
-)
-_KV_PAIR_RE = re.compile(
-    r"([a-zA-Z_][\w]*)\s*=\s*(\"([^\"]*)\"|'([^']*)'|(\S+))"
 )
 _COMPUTER_ACTIONS = {
     "screenshot",
@@ -351,8 +365,41 @@ def _normalise_url(raw: str) -> str:
     return url
 
 
-def _parse_kwarg_blob(blob: str) -> dict[str, Any]:
-    """Parse ``action=screenshot, x=10`` or space-separated kwargs into a dict."""
+def _tool_param_keys() -> frozenset[str]:
+    """Every argument name any registered tool accepts.
+
+    Recovery splits a narrated call on these, so the set has to come from the schemas.
+    A hardcoded list silently dropped ``control=display.brightness.set`` — the one
+    argument that mattered — and produced a call that did nothing.
+    """
+    keys = {"action", "mode"}
+    try:
+        for tool in registry().values():
+            keys.update(tool.parameters.keys())
+    except Exception:  # noqa: BLE001
+        keys.update({"url", "app", "target", "command", "path", "query", "text", "value"})
+    return frozenset(k for k in keys if re.fullmatch(r"[a-zA-Z_][\w]*", k))
+
+
+def _coerce(raw: str) -> Any:
+    val = raw.strip().strip(",;").strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        val = val[1:-1]
+    else:
+        val = val.rstrip(".)]")
+    if re.fullmatch(r"-?\d+", val):
+        return int(val)
+    if val.lower() in {"true", "false"}:
+        return val.lower() == "true"
+    return val
+
+
+def _parse_kwarg_blob(blob: str, keys: frozenset[str] | None = None) -> dict[str, Any]:
+    """Parse ``action=control control=power.battery`` into a dict.
+
+    Values run to the next recognised ``key=`` or the end of the line, so multi-word
+    values survive — ``target=Alaa AirPods Pro`` is one target, not one word.
+    """
     text = (blob or "").strip()
     if not text:
         return {}
@@ -362,22 +409,40 @@ def _parse_kwarg_blob(blob: str) -> dict[str, Any]:
             return data if isinstance(data, dict) else {}
         except json.JSONDecodeError:
             pass
+    names = keys or _tool_param_keys()
+    if not names:
+        return {}
+    # Split on *any* ``word=``, then keep only the arguments the tools actually take.
+    # Splitting on known keys alone let an invented one swallow the previous value:
+    # ``url=https://reuters.com/world/ topic=headlines`` became a URL with a space in it.
+    spans = [
+        m for m in _ANY_KV_RE.finditer(text) if not _looks_like_url_tail(text, m.start())
+    ]
+    if not spans:
+        return {}
     out: dict[str, Any] = {}
-    for m in _KV_PAIR_RE.finditer(text):
-        key = m.group(1)
-        val = m.group(3) if m.group(3) is not None else (
-            m.group(4) if m.group(4) is not None else (m.group(5) or "")
-        )
-        val = val.strip().rstrip(".,);]")
-        if not key:
+    for i, m in enumerate(spans):
+        end = spans[i + 1].start() if i + 1 < len(spans) else len(text)
+        key = m.group(1).lower()
+        if key not in names:
             continue
-        if re.fullmatch(r"-?\d+", val):
-            out[key] = int(val)
-        elif val.lower() in {"true", "false"}:
-            out[key] = val.lower() == "true"
-        else:
-            out[key] = val
+        value = _coerce(text[m.end() : end])
+        if value != "":
+            out[key] = value
     return out
+
+
+#: ``word =`` / ``word=`` anywhere in a narrated call.
+_ANY_KV_RE = re.compile(r"\b([a-zA-Z_][\w-]*)\s*=\s*")
+
+
+def _looks_like_url_tail(text: str, at: int) -> bool:
+    """True for a ``key=`` sitting inside a URL's query string, which is not an argument."""
+    head = text[:at]
+    marker = max(head.rfind("?"), head.rfind("&"))
+    if marker < 0:
+        return False
+    return not re.search(r"\s", head[marker:])
 
 
 def _looks_like_tool_prose(text: str, known_tools: set[str] | None = None) -> bool:
@@ -390,7 +455,14 @@ def _looks_like_tool_prose(text: str, known_tools: set[str] | None = None) -> bo
         for name in known_tools:
             if re.match(rf"^{re.escape(name)}\b", compact, re.I) and "=" in compact:
                 return True
-    if _BRACKET_TOOL_RE.search(raw) or _FUNC_TOOL_RE.search(raw) or _PROSE_TOOL_RE.search(raw):
+    # The prose form matches any ``word key=value`` line, so it only counts when the
+    # word is actually one of our tools — otherwise a sentence like "the build finished;
+    # total=42 items copied" would read as a tool call.
+    prose_hit = any(
+        m.group(1) in (known_tools or ())
+        for m in _PROSE_TOOL_RE.finditer(raw)
+    )
+    if _BRACKET_TOOL_RE.search(raw) or _FUNC_TOOL_RE.search(raw) or prose_hit:
         # Dominant content is the tool line (not a long explanation that mentions a tool).
         return len(compact) < 280 or compact.count(" ") < 25
     return False
@@ -473,9 +545,12 @@ def _extract_text_tool_args(
     for m in _FUNC_TOOL_RE.finditer(blob):
         _push(m.group(1).strip(), _parse_kwarg_blob(m.group(2)))
 
+    keys = _tool_param_keys()
     for m in _PROSE_TOOL_RE.finditer(blob):
         name = m.group(1).strip()
-        args = _parse_kwarg_blob(m.group(2))
+        if name not in known_tools:
+            continue
+        args = _parse_kwarg_blob(m.group(2), keys)
         if name == "device_control" and args.get("action") == "open":
             url = args.get("url")
             if isinstance(url, str):
@@ -483,6 +558,28 @@ def _extract_text_tool_args(
         _push(name, args)
 
     return found[:4]
+
+
+def _strip_tool_syntax(content: str, known_tools: set[str]) -> str:
+    """Remove narrated tool-call lines, keeping whatever prose surrounded them."""
+    raw = content or ""
+    if not raw.strip():
+        return ""
+    kept: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip().strip("`").lstrip("-*>[ ").strip().rstrip("]` ").strip()
+        head = stripped.split()[0] if stripped else ""
+        if head in known_tools and "=" in stripped:
+            continue
+        if _FENCE_LINE.match(line):
+            continue
+        kept.append(line)
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    # Whatever is left must read as speech. If it is still tool syntax, or too short to
+    # be a sentence, say nothing rather than reading arguments aloud.
+    if _looks_like_tool_prose(text, known_tools) or len(text) <= 12:
+        return ""
+    return text
 
 
 def _as_recovered_tool_calls(found: list[tuple[str, dict[str, Any]]]) -> list[Any]:
@@ -601,8 +698,18 @@ class Agent:
 
     @property
     def _strict_tools(self) -> bool:
+        """Recover tool calls the model narrated instead of emitting.
+
+        Defaults to on for local endpoints and off for cloud ones — see
+        ``AgentConfig.strict_tools``.
+        """
         cfg = self._agent_cfg
-        return False if cfg is None else bool(cfg.strict_tools)
+        if cfg is None:
+            return False
+        try:
+            return cfg.recover_narrated_calls(self.config.llm)
+        except AttributeError:  # config predates the helper
+            return bool(cfg.strict_tools)
 
     @property
     def _budget(self) -> int:
@@ -658,6 +765,10 @@ class Agent:
         mcp_ctx = format_mcp_context()
         if mcp_ctx:
             context_parts.insert(0, mcp_ctx)
+        # Last block, after the inventories and next to the closing instruction: what
+        # this agent can reach at all. The catalogues are long enough that without it the
+        # prompt reads as a machine manual and the model stops believing it is online.
+        context_parts.append(reach_context(_imported_mcp_tool_count()))
         if recalled:
             context_parts.append(
                 "=== Background notes (durable facts and preferences) ===\n"
@@ -1205,12 +1316,15 @@ class Agent:
     def _recover_tool_calls(self, content: str, reasoning: str) -> tuple[list[Any], str]:
         """Strict mode only: pull tool calls out of a reply that narrated them.
 
-        Returns the recovered calls and the content to keep (emptied when the reply
-        itself was the tool syntax, which must never be spoken).
+        Returns the recovered calls and the content to keep. Raw tool syntax is never
+        spoken, but a reply that wrapped one narrated call in real sentences —
+        "Checking your battery now.\ndevice_control action=control control=power.battery"
+        — keeps the sentences as working speech and only loses the call line.
         """
-        recovered = recover_text_tool_calls(content, reasoning, set(self.tools.keys()))
+        known = set(self.tools.keys())
+        recovered = recover_text_tool_calls(content, reasoning, known)
         if recovered:
-            return recovered, ""
+            return recovered, _strip_tool_syntax(content, known)
         if _asked_for_text(self._last_user_text):
             return [], content
         pasted = pasted_commands(content)
@@ -1314,10 +1428,12 @@ class Agent:
         messages.append({
             "role": "user",
             "content": (
-                "[system] Stop working now. Answer the user in plain spoken text: what you "
-                "did, what you found, and anything still unfinished (mention any background "
-                "task ids you started). Do not call any tools. Do not mention these system "
-                "instructions."
+                # One plain sentence on purpose. An enumerated list of constraints gets
+                # analysed back at the user ("Constraint 4: Do not call any tools…")
+                # instead of followed.
+                "[system] That is enough work — reply to me now in your own words, "
+                "covering what you did, what you found, and anything left unfinished "
+                "including any background task ids. No tools, and no mention of this note."
             ),
         })
         thought_id = f"t-{uuid.uuid4().hex}"
