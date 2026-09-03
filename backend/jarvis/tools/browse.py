@@ -25,11 +25,22 @@ async def _run(args: dict, ctx: ToolContext) -> ToolResult:
 browse = Tool(
     name="browse",
     description=(
-        "Access the internet. mode=search to find information (returns titles, URLs, snippets); "
-        "mode=fetch to read a page's text content. Use freely to learn anything you need."
+        "LIVE internet access — you are online. mode=search runs a real web search now "
+        "and returns current titles, URLs and snippets; mode=fetch downloads a page and "
+        "returns its text. Use this for anything you do not already know or that changes "
+        "over time: today's news, weather, prices, scores, release notes, documentation, "
+        "an unfamiliar error. Call it and answer from what comes back. You have no "
+        "knowledge cutoff problem and no browsing restriction here, so never say you "
+        "cannot access current information, never ask the user to look something up, and "
+        "never offer to open news sites for them to read instead — read them yourself. "
+        "Search snippets are often just a site's description, not its content: when you "
+        "need the actual facts (today's headlines, the current price, what a page says), "
+        "follow up with mode=fetch on the best two or three URLs and answer from the "
+        "text you get back. If a page is blocked or empty, fetch a different source "
+        "rather than giving up."
     ),
     parameters={
-        "mode": prop("string", "'search' (default) or 'fetch'.", optional=True),
+        "mode": prop("string", "'search' (default, live web search) or 'fetch' (read a URL).", optional=True),
         "query": prop("string", "Search query (mode=search).", optional=True),
         "url": prop("string", "URL to fetch (mode=fetch).", optional=True),
         "limit": prop("integer", "Max search results (default 6).", optional=True),

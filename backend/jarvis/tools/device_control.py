@@ -163,7 +163,8 @@ async def _run_control(args: dict, ctx: ToolContext) -> ToolResult:
     if not ref:
         return ToolResult(
             False,
-            "control action requires control=<id>. Call action=controls to list them.",
+            "control action requires a control id, e.g. control=power.battery. "
+            "Call action=controls query=<word> to find the right one.",
         )
     control, params = _resolve_control(args)
     if control is None:
@@ -180,6 +181,43 @@ async def _run_control(args: dict, ctx: ToolContext) -> ToolResult:
     )
     label = f"[{control.id}] {control.summary}"
     return ToolResult(result.ok, f"{label}\n{result.output}")
+
+
+#: Actions that belong to a different tool. JARVIS's tools are coarse, so a model that
+#: has settled on device_control tends to try everything through it; each of these was
+#: observed in a real transcript, followed by the model telling the user the capability
+#: was unavailable.
+_BROWSE_HINT = (
+    "Web access is its own tool: call browse with mode=search query=<terms> to search, "
+    "or mode=fetch url=<url> to read a page. You are online — do not report otherwise."
+)
+_OTHER_TOOL_ACTIONS: dict[str, str] = {
+    "browse": _BROWSE_HINT,
+    "search": _BROWSE_HINT,
+    "web": _BROWSE_HINT,
+    "web_search": _BROWSE_HINT,
+    "fetch": _BROWSE_HINT,
+    "url": _BROWSE_HINT,
+    "google": _BROWSE_HINT,
+    "screenshot": (
+        "Screen capture and input belong to computer_use: action=screenshot, then "
+        "click/type/key/scroll."
+    ),
+    "click": "Mouse and keyboard input belong to computer_use (action=click/type/key/scroll).",
+    "type": "Mouse and keyboard input belong to computer_use (action=click/type/key/scroll).",
+    "key": "Mouse and keyboard input belong to computer_use (action=click/type/key/scroll).",
+    "scroll": "Mouse and keyboard input belong to computer_use (action=click/type/key/scroll).",
+    "connect": (
+        "Attached hardware belongs to the peripherals tool: action=connect "
+        "target=<name> pairs, connects and routes audio in one call."
+    ),
+    "pair": "Attached hardware belongs to the peripherals tool (action=pair target=<name>).",
+    "disconnect": "Attached hardware belongs to the peripherals tool (action=disconnect).",
+    "scan": "Use peripherals action=scan for hardware, or browse for the web.",
+    "email": "Email belongs to the communicate tool (action=send/read).",
+    "send": "Email belongs to the communicate tool (action=send).",
+    "remember": "Durable facts belong to the remember tool.",
+}
 
 
 async def _list_controls(args: dict) -> ToolResult:
@@ -215,15 +253,60 @@ async def _list_controls(args: dict) -> ToolResult:
         lines.append("\nInstall to unlock more:")
         for gap in gaps[:8]:
             lines.append(f"  {gap['package']} → {gap['unlocks']}")
+    # A listing is a lookup, never an answer. Without this the model reports the
+    # catalogue back to the user and stops, one call short of doing the job.
+    lines.append(
+        "\nThis is a lookup result, not an answer. Now call action=control with the id "
+        "that matches the request and report what it returns. Do not list these to the "
+        "user."
+    )
     return ToolResult(True, "\n".join(lines))
 
 
+_ACTIONS = frozenset({
+    "control", "controls", "capabilities", "shell", "read", "write", "list",
+    "move", "delete", "open", "apps", "find_app", "applications",
+})
+
+
+def _normalise_action(args: dict) -> tuple[str, dict]:
+    """Pull the action out of ``args``, tolerating a few malformed shapes.
+
+    Models fuse the action and its target into one field —
+    ``action="control system.processes.top"`` — and the strict reading of that is
+    "unknown action", which sends the model hunting for a capability it already had.
+    """
+    raw = str(args.get("action") or args.get("mode") or "").strip()
+    action = raw.lower()
+    if action in _ACTIONS or not action:
+        return action, args
+    head, _, rest = action.partition(" ")
+    if head not in _ACTIONS or not rest.strip():
+        return action, args
+    merged = dict(args)
+    merged["action"] = head
+    target = raw.split(None, 1)[1].strip()
+    if head == "control" and not merged.get("control"):
+        merged["control"] = target
+    elif head in {"controls", "capabilities", "apps"} and not merged.get("query"):
+        merged["query"] = target
+    elif head == "shell" and not merged.get("command"):
+        merged["command"] = target
+    elif head == "open" and not (merged.get("app") or merged.get("url")):
+        merged["url" if "/" in target or "." in target else "app"] = target
+    elif head in {"read", "write", "list", "delete"} and not merged.get("path"):
+        merged["path"] = target
+    return head, merged
+
+
 async def _run(args: dict, ctx: ToolContext) -> ToolResult:
-    action = (args.get("action") or "").strip().lower()
+    action, args = _normalise_action(args)
     if not action:
         return ToolResult(
             False,
-            "Missing action. Use: control, controls, shell, read, write, list, move, delete, open, apps.",
+            "Missing action. Use: control, controls, shell, read, write, list, move, "
+            "delete, open, apps. For the web use the browse tool, for the screen "
+            "computer_use, for attached hardware peripherals.",
         )
 
     if action == "shell":
@@ -305,9 +388,17 @@ async def _run(args: dict, ctx: ToolContext) -> ToolResult:
             return await apps._open_url({"url": file_target}, ctx)
         return ToolResult(False, "open action requires url, app/target, or file.")
 
+    hint = _OTHER_TOOL_ACTIONS.get(action)
+    if hint:
+        # The model reached for the right capability through the wrong tool. Saying so
+        # turns a dead end into a correct next call — left as a bare "unknown action"
+        # it concludes the capability does not exist and tells the user so.
+        return ToolResult(False, f"'{action}' is not a device_control action. {hint}")
     return ToolResult(
         False,
-        f"Unknown action '{action}'. Use: control, controls, shell, read, write, list, move, delete, open, apps.",
+        f"Unknown action '{action}'. device_control actions: control, controls, shell, "
+        "read, write, list, move, delete, open, apps. For the web use the browse tool; "
+        "for the screen computer_use; for attached hardware peripherals.",
     )
 
 
@@ -318,8 +409,9 @@ device_control = Tool(
         "available utilities — every action it can perform is listed in your context "
         "under 'Device controls available on this machine'. "
         "Actions: "
-        "control (PREFERRED — perform one catalogued action by id: control=<id> "
-        "value=<v>, e.g. control=display.brightness.set value=30, "
+        "control (PREFERRED — perform one catalogued action by its id, copied verbatim "
+        "from the list in your context, never a placeholder: "
+        "e.g. control=display.brightness.set value=30, control=power.battery, "
         "control=audio.volume.down value=10, control=network.wifi.connect value=<ssid>. "
         "The command, backend, and OS quirks are already resolved for this host), "
         "controls (list or search every action available here — query=<word>), "
