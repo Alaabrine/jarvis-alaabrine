@@ -286,7 +286,11 @@ class RemSleepService:
         )
 
     def _phase_light(self) -> list[str]:
-        """Stage recent short-term conversation / device memories."""
+        """Stage recent short-term conversation / device memories.
+
+        Staged rows are episodic: ``Memory.recall`` never surfaces them in a chat, so
+        they exist purely as raw material for the REM and deep phases below.
+        """
         rows = self.memory.list_memories(
             kinds=["conversation", "device", "peripheral", "short_term"], limit=80
         )
@@ -334,9 +338,15 @@ class RemSleepService:
         llm = LLMClient(cfg.llm)
         prompt = (
             "You are consolidating JARVIS short-term memories during REM sleep.\n"
-            "From the notes below, extract 3-8 recurring themes or durable facts about the user, "
-            "their devices, preferences, or ongoing projects.\n"
-            "Skip one-off commands (open a URL, launch an app) unless they clearly recur.\n"
+            "From the notes below, extract 3-8 recurring themes or durable facts about the "
+            "user, their devices, or their standing preferences.\n"
+            "Only durable statements qualify. Skip one-off commands (open a URL, launch an "
+            "app, dim the screen), anything phrased as a task, request, or unfinished work, "
+            "and anything that would read as an instruction if it were replayed later — "
+            "these notes are recalled into unrelated future conversations, where a stale "
+            "task brief makes JARVIS act on a request nobody made.\n"
+            "Write each item as a fact ('prefers Firefox', 'keyboard backlight is ASUS "
+            "Aura'), never as an imperative.\n"
             "Return ONLY a JSON array of short strings. No markdown.\n\n"
             f"Notes:\n{corpus}"
         )

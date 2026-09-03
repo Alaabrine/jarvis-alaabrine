@@ -518,19 +518,33 @@ class Memory:
         return cur.rowcount
 
     def recall(
-        self, query: str, query_embedding: list[float] | None = None, limit: int = 6
+        self,
+        query: str,
+        query_embedding: list[float] | None = None,
+        limit: int = 6,
+        include_episodic: bool = False,
     ) -> list[str]:
-        """Return memories relevant to *query* only.
+        """Return durable memories relevant to *query* only.
 
-        Long-term memory is kept, but nothing is injected when relevance is weak.
-        Episodic conversation notes need a higher bar than durable facts so past
-        chats cannot hijack an unrelated turn.
+        Episodic notes — chat summaries, REM staging, short-term traces — are excluded
+        by default and never leave the conversation they came from. They describe what
+        someone once asked for, so recalling one into a later chat makes JARVIS resume
+        a task nobody asked about. Only stable facts and preferences cross sessions,
+        and even those are withheld when relevance is weak.
         """
+        params: list[Any] = []
+        where = ""
+        if not include_episodic:
+            placeholders = ",".join("?" * len(_EPISODIC_KINDS))
+            where = f" WHERE kind NOT IN ({placeholders})"
+            params.extend(sorted(_EPISODIC_KINDS))
         rows = self.conn.execute(
-            "SELECT text, embedding, kind FROM memories ORDER BY "
+            "SELECT text, embedding, kind FROM memories"
+            f"{where} ORDER BY "
             "CASE kind WHEN 'long_term' THEN 0 WHEN 'rem_theme' THEN 1 "
             "WHEN 'device' THEN 2 WHEN 'peripheral' THEN 2 WHEN 'device_control' THEN 2 "
-            "ELSE 3 END, id DESC"
+            "ELSE 3 END, id DESC",
+            params,
         ).fetchall()
         if not rows:
             return []
@@ -594,7 +608,8 @@ class Memory:
         return [t for _, t in scored_kw[:limit]]
 
 
-# Recalled notes that are chat transcripts / REM staging — require tighter match.
+#: Session-scoped notes: chat transcripts and REM staging. Never recalled across
+#: conversations — see ``Memory.recall``. Still visible in the memory bank UI.
 _EPISODIC_KINDS = frozenset({"conversation", "staged", "short_term"})
 _DURABLE_KINDS = frozenset(
     {"long_term", "device", "peripheral", "device_control", "preference", "fact"}
